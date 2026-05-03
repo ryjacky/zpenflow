@@ -1,23 +1,26 @@
 //! Penflow session orchestrator.
 //!
-//! See `docs/design.md` §9. This crate ties together the engine, transport,
-//! and protocol layers into a single tokio-driven session loop.
+//! See `docs/design.md` §9. This crate ties together the engine
+//! ([`penflow_core::Engine`]), the transport
+//! ([`penflow_transport::Transport`]), and the wire protocol
+//! ([`penflow_protocol`]) into a single tokio-driven session loop.
 
 #![deny(missing_docs)]
 
-/// Returns a build identifier string. Used as a cross-crate sanity test
-/// until the real session loop lands.
-pub fn build_id() -> &'static str {
-    "penflow-server v0.1.0 (pre-session)"
-}
+#[cfg(windows)]
+pub mod session;
+
+#[cfg(windows)]
+pub use session::{Session, SessionConfig, SessionError, SessionEvent};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
+    #[cfg(windows)]
     #[test]
-    fn server_can_reference_engine_types() {
-        assert!(penflow_core::build_id().contains("penflow-core"));
-        assert!(build_id().contains("penflow-server"));
+    fn session_config_default_round_trips() {
+        let cfg = super::SessionConfig::default();
+        assert_eq!(cfg.fps, 60);
+        assert_eq!(cfg.codec, penflow_core::encoder::Codec::Hevc);
+        assert!(cfg.bitrate_bps >= 1_000_000);
     }
 }

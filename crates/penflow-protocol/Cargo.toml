@@ -7,3 +7,8 @@ license.workspace = true
 description = "Penflow PC↔Android wire-format constants and types."
 
 [dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "io-util"] }

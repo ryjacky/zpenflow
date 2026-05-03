@@ -10,6 +10,6 @@ description = "Penflow tokio session orchestrator."
 penflow-core = { path = "../penflow-core" }
 penflow-protocol = { path = "../penflow-protocol" }
 penflow-transport = { path = "../penflow-transport" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "io-util", "macros"] }
 async-trait.workspace = true
 thiserror.workspace = true

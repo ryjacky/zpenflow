@@ -1,8 +1,10 @@
 //! Transport abstraction over the PC↔Android byte stream.
 //!
-//! See `docs/design.md` §8 for the full transport design. Wave 3 adds
-//! `AdbLocalAbstractTransport`. A future raw-USB transport adds a single
-//! new module here without touching any other crate.
+//! See `docs/design.md` §8 for the full transport design. Today: one
+//! implementation, [`adb::AdbLocalAbstractTransport`], which exposes a TCP
+//! port over an ADB reverse tunnel to a `localabstract:` socket on the
+//! device. Future raw-USB transport adds a single new module without
+//! touching the consumers.
 
 #![deny(missing_docs)]
 
@@ -10,6 +12,9 @@ use std::io;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+#[cfg(any(unix, windows))]
+pub mod adb;
 
 /// One bidirectional byte stream to the connected Android client.
 ///
