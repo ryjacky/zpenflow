@@ -1,8 +1,11 @@
 package dev.penflow
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -20,15 +23,30 @@ import java.util.ArrayDeque
  * `video/avc` or `video/hevc`. The csd-0 layout is opaque to us — MediaCodec
  * consumes whatever NVENC produced.
  *
- * ## Latency-sensitive tuning
+ * ## Latency-sensitive tuning (design.md §10.2 / HANDOFF §1.3)
  *
  * - `KEY_LOW_LATENCY = 1` — Android 11+ canonical low-latency hint.
- * - `KEY_OPERATING_RATE = 240` — promise the codec we'll feed faster than
- *   real-time; lets the SoC pick a higher clock domain.
- * - `KEY_PRIORITY = 0` — realtime priority class (vs the default 1, which is
- *   "best effort").
- * - `vendor.qti-ext-dec-low-latency.enable = 1` — Qualcomm-private low-latency
- *   pipeline switch. Non-Qualcomm devices ignore unknown vendor keys.
+ * - **Qualcomm**: `KEY_OPERATING_RATE = Short.MAX_VALUE`, do NOT set
+ *   `KEY_PRIORITY = 0`. The combination crashes Adreno 620 (Snapdragon
+ *   765G — Mi 10 lite 5G, Redmi K30i 5G) per moonlight-android's
+ *   `MediaCodecHelper.java:482`. The dev rig (MovinkPad's Adreno 720) is
+ *   fine, but anyone with a 765G-class device used to SIGSEGV on connect.
+ * - **Non-Qualcomm**: `KEY_PRIORITY = 0` is safe; do NOT set
+ *   `KEY_OPERATING_RATE`.
+ * - `vendor.qti-ext-dec-low-latency.enable = 1` — Qualcomm-private
+ *   low-latency pipeline switch.
+ * - `vendor.qti-ext-dec-picture-order.enable = 1` — Qualcomm-private flag
+ *   that disables HEVC reorder buffering. Saves 5–10 ms per frame on
+ *   Qualcomm chips (moonlight-android finding).
+ *
+ * ## Frame pacing (design.md §10.6 — MIN_LATENCY mode)
+ *
+ * Older code unconditionally called `releaseOutputBuffer(index, true)` which
+ * always renders. Under load that can pile up multiple buffers per vsync.
+ * The async-safe MIN_LATENCY pattern below coalesces callback bursts to the
+ * newest output index, releasing older indices with `render = false`, and
+ * posts the render release on the codec handler so SurfaceFlinger can drop
+ * late buffers automatically.
  *
  * ## Input-buffer feeding
  *
@@ -50,29 +68,69 @@ class VideoDecoder(
     private val mime: String = mimeFor(codecId)
     private val codec: MediaCodec = MediaCodec.createDecoderByType(mime)
 
-    // Single mutex protecting both queues. Producer (network thread) calls
-    // feed(); consumer (codec callback thread) calls onInputBufferAvailable.
+    /** Owning codec callbacks; same handler is reused for posted render releases. */
+    private val codecThread = HandlerThread("video-codec").apply { start() }
+    private val codecHandler = Handler(codecThread.looper)
+
+    // Single mutex protecting both INPUT queues. Producer (network thread)
+    // calls feed(); consumer (codec callback thread) calls onInputBufferAvailable.
     private val lock = Any()
     private val pendingData = ArrayDeque<ByteArray>()
     private val parkedIndices = ArrayDeque<Int>()
 
+    // OUTPUT-side MIN_LATENCY state — drains to newest output index, drops the rest.
+    private val outputLock = Any()
+    private var newestOutputIndex: Int? = null
+    private var renderPosted = false
+
     fun start() {
+        // Identify the chosen codec's vendor so we apply the right vendor-key
+        // ladder (design.md §10.2). codec.name reflects the codec we got from
+        // createDecoderByType — known before we call configure(), which is
+        // when we need the format flags ready.
+        val codecName = codec.name.lowercase()
+        val isQualcomm = codecName.startsWith("omx.qcom.") || codecName.startsWith("c2.qti.")
+        val isKirin = codecName.startsWith("omx.hisi.") || codecName.startsWith("c2.hisi.")
+        val isExynos = codecName.startsWith("omx.exynos.") || codecName.startsWith("c2.exynos.")
+
         val format = MediaFormat.createVideoFormat(mime, width, height).apply {
             setByteBuffer("csd-0", ByteBuffer.wrap(csd0))
             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
 
-            // Latency-sensitive operation: tell the codec we'll feed at up to
-            // 240 fps so it picks a high clock domain rather than throttling.
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
-                setInteger(MediaFormat.KEY_PRIORITY, 0)
+            if (isQualcomm) {
+                // Adreno 620 fix: do NOT set KEY_PRIORITY=0 alongside
+                // KEY_OPERATING_RATE on Qualcomm. Use moonlight's value
+                // (Short.MAX_VALUE) for KEY_OPERATING_RATE alone.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+                    // Disables HEVC reorder buffering on Qualcomm chips —
+                    // saves 5–10 ms of decode delay per frame.
+                    setInteger("vendor.qti-ext-dec-picture-order.enable", 1)
+                }
+            } else {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    setInteger(MediaFormat.KEY_PRIORITY, 0)
+                }
+                // Best-effort vendor low-latency hints for non-Qualcomm
+                // SoCs. Unknown vendor keys are silently ignored by codecs
+                // that don't recognise them; we set them anyway because the
+                // ones the codec DOES recognise carry meaningful latency
+                // wins.
+                if (isKirin && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    setInteger(
+                        "vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req",
+                        1,
+                    )
+                }
+                if (isExynos && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
+                }
             }
-
-            // Qualcomm-private low-latency flag. Setting on non-Qualcomm
-            // devices is a silent no-op (MediaFormat doesn't validate vendor
-            // keys against the codec).
-            setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
         }
 
         codec.setCallback(object : MediaCodec.Callback() {
@@ -81,7 +139,6 @@ class VideoDecoder(
                     if (pendingData.isNotEmpty()) {
                         pendingData.removeFirst()
                     } else {
-                        // No data yet — park this index for feed() to pick up.
                         parkedIndices.addLast(index)
                         null
                     }
@@ -97,7 +154,40 @@ class VideoDecoder(
                 info: MediaCodec.BufferInfo
             ) {
                 val decodedNs = System.nanoTime()
-                c.releaseOutputBuffer(index, true)
+
+                // MIN_LATENCY drain: keep only the newest index, release any
+                // older one with render=false. Post the render release on the
+                // codec handler so SurfaceFlinger can supersede it if a newer
+                // buffer arrives in the same vsync window.
+                var shouldPostRender = false
+                val dropped: Int? = synchronized(outputLock) {
+                    val d = newestOutputIndex
+                    newestOutputIndex = index
+                    if (!renderPosted) {
+                        renderPosted = true
+                        shouldPostRender = true
+                    }
+                    d
+                }
+                dropped?.let { c.releaseOutputBuffer(it, false) }
+
+                if (shouldPostRender) {
+                    codecHandler.post {
+                        val toRender: Int? = synchronized(outputLock) {
+                            val chosen = newestOutputIndex
+                            newestOutputIndex = null
+                            renderPosted = false
+                            chosen
+                        }
+                        toRender?.let { idx ->
+                            // Pass System.nanoTime() as the render PTS so
+                            // SurfaceFlinger schedules for the next vsync
+                            // and drops late buffers if superseded under load.
+                            c.releaseOutputBuffer(idx, System.nanoTime())
+                        }
+                    }
+                }
+
                 onDecoded(decodedNs)
             }
 
@@ -108,11 +198,15 @@ class VideoDecoder(
             override fun onOutputFormatChanged(c: MediaCodec, format: MediaFormat) {
                 Log.i(TAG, "decoder output format: $format")
             }
-        })
+        }, codecHandler)
 
         codec.configure(format, surface, null, 0)
         codec.start()
-        Log.i(TAG, "started $mime decoder ${width}x${height}@${fps} (operating_rate=240)")
+        Log.i(
+            TAG,
+            "started $mime decoder ${width}x${height}@${fps} on $codecName " +
+                "(qualcomm=$isQualcomm)"
+        )
     }
 
     /** Submit a coded video access unit (Annex-B framed). */
@@ -143,6 +237,7 @@ class VideoDecoder(
         } catch (_: IllegalStateException) {
         }
         codec.release()
+        codecThread.quitSafely()
     }
 
     companion object {

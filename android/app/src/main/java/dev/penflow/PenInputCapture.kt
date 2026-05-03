@@ -25,6 +25,14 @@ class PenInputCapture(
 
     private var lastButtonsRaw = 0  // bitmask straight from MotionEvent
 
+    // Spatial dead zone after stylus lift (HANDOFF §1.3, design §10.7).
+    // Without this, fast tap-and-go strokes can register a phantom second
+    // contact within ~5px of the lift coordinates as a double-click.
+    // Moonlight enforces ~5 px — adopting the same value.
+    private var lastUpX: Float = Float.NaN
+    private var lastUpY: Float = Float.NaN
+    private var lastUpTimeMs: Long = 0L
+
     /** A normalized pen sample ready for wire encoding. */
     data class PenSample(
         val tsNs: Long,
@@ -43,6 +51,26 @@ class PenInputCapture(
 
         val tool = if (ev.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER) 1 else 0
         val phase = mapPhase(ev.actionMasked)
+
+        // Dead-zone gate: suppress new DOWN/HOVER samples that land within
+        // DEAD_ZONE_PX of the last UP, within DEAD_ZONE_MS. Tap-then-tap
+        // sequences come through reliably (separated by enough time);
+        // accidental "fast lift, finger trembled, brief re-contact" does
+        // not (HANDOFF §1.3 / design §10.7).
+        val isFreshContact = phase == 1 || phase == 0  // DOWN or HOVER_*
+        if (isFreshContact && !lastUpX.isNaN()) {
+            val dx = ev.x - lastUpX
+            val dy = ev.y - lastUpY
+            val dt = ev.eventTime - lastUpTimeMs
+            if (dt < DEAD_ZONE_MS && (dx * dx + dy * dy) < DEAD_ZONE_PX_SQ) {
+                return true  // consume but emit nothing
+            }
+        }
+        if (phase == 3) {  // ACTION_UP
+            lastUpX = ev.x
+            lastUpY = ev.y
+            lastUpTimeMs = ev.eventTime
+        }
 
         val w = viewWidth().coerceAtLeast(1).toFloat()
         val h = viewHeight().coerceAtLeast(1).toFloat()
@@ -145,5 +173,10 @@ class PenInputCapture(
             MotionEvent.TOOL_TYPE_STYLUS,
             MotionEvent.TOOL_TYPE_ERASER
         )
+
+        /** Spatial dead zone radius in view pixels (squared for cheap compare). */
+        private const val DEAD_ZONE_PX_SQ = 5f * 5f
+        /** Time window in ms during which the dead zone applies after ACTION_UP. */
+        private const val DEAD_ZONE_MS = 80L
     }
 }
