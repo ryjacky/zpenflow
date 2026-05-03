@@ -88,7 +88,17 @@ impl Engine {
             codec: Codec::Hevc,
             bitrate_bps: 50_000_000,
             fps: 60,
-            acquire_timeout: Duration::from_millis(200),
+            // One-frame budget at 120 fps (default). Short enough that a
+            // static desktop still encodes the keepalive at the configured
+            // cadence — design.md §6.1 / HANDOFF §2.3 #2 explicitly want
+            // "re-encode the last captured frame at the configured fps"
+            // when DDA times out, otherwise the encoder's HaveOutput
+            // events sit in the MFT queue and `Instant::now()` inside
+            // `collect_output_packet` ends up bound by the next pipeline
+            // tick (the Android HUD then reports 200 ms encode_us / net
+            // when idle). Sunshine's 200 ms recommendation is for a
+            // different keepalive shape; ours needs to match fps.
+            acquire_timeout: Duration::from_millis(8),
             packet_queue_capacity: 8,
             pts_epoch: None,
         }

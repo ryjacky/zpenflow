@@ -60,7 +60,12 @@ impl Default for PipelineConfig {
             width: 2560,
             height: 1440,
             fps: 60,
-            acquire_timeout: Duration::from_millis(200),
+            // Roughly one-frame budget at 120 fps. See `EngineBuilder`'s
+            // matching default for the rationale — short timeouts keep
+            // the encoder's event drain cadence aligned with the
+            // configured fps so HUD encode_us / net don't balloon when
+            // the desktop is static.
+            acquire_timeout: Duration::from_millis(8),
             packet_queue_capacity: 8,
             pts_epoch: Instant::now(),
         }
