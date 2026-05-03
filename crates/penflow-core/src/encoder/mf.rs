@@ -94,11 +94,23 @@ pub struct MfSession {
     /// Internal output queue — packets we drained from `METransformHaveOutput`
     /// events but the caller hasn't claimed yet.
     output_queue: VecDeque<EncodedPacket>,
-    /// (pts, submit_instant, force_idr) of the most recent `submit_frame`,
-    /// used to stamp the next packet emitted by the encoder. MF doesn't
-    /// reorder so this is a safe 1:1 mapping. `submit_instant` is the
-    /// wall-clock anchor for `EncodedPacket::encode_us`.
-    pending_input_meta: Option<(i64, Instant, bool)>,
+    /// FIFO of `(pts_ns, submit_instant)` per submitted input frame, used to
+    /// stamp emitted packets in order. MF preserves order (no B-frames;
+    /// zero-reorder MFT) so the i-th submit corresponds to the i-th
+    /// output.
+    ///
+    /// Why a FIFO and not a single-slot `Option`: `submit_frame` blocks on
+    /// `wait_for_need_input`, which drains *previous* frames'
+    /// `HaveOutput` events into `output_queue` BEFORE we touch the meta
+    /// slot. With a single slot, the sequence is:
+    ///   1. submit(N).wait_for_need_input → drains N-1's output
+    ///   2. submit(N).ProcessInput
+    ///   3. submit(N) sets meta = (pts_N, instant_N)
+    ///   4. try_packet pops N-1's packet, takes N's meta → encode_us
+    ///      ≈ 0 µs (the meta was set ~1 µs ago) and the PTS is wrong.
+    /// A FIFO eliminates this skew: each submit appends, each pop
+    /// consumes the head, so packet ↔ meta line up correctly.
+    pending_input_meta: VecDeque<(i64, Instant)>,
 }
 
 const STREAM_ID: u32 = 0;
@@ -164,7 +176,7 @@ impl MfSession {
             _dev_mgr: dev_mgr,
             sequence_header: Vec::new(),
             output_queue: VecDeque::new(),
-            pending_input_meta: None,
+            pending_input_meta: VecDeque::new(),
         })
     }
 
@@ -316,19 +328,24 @@ impl EncodeSession for MfSession {
         unsafe { self.transform.ProcessInput(STREAM_ID, &sample, 0)? };
         // Anchor *after* ProcessInput returns so encode_us measures only
         // the encoder's wall-clock work, not the caller's pre-submit
-        // texture wrap / SetSampleTime overhead.
-        self.pending_input_meta = Some((pts_ns, Instant::now(), force_idr));
+        // texture wrap / SetSampleTime overhead. `force_idr` isn't
+        // tracked on the meta record because we don't surface it
+        // anywhere downstream.
+        let _ = force_idr;
+        self.pending_input_meta
+            .push_back((pts_ns, Instant::now()));
         Ok(())
     }
 
     fn try_packet(&mut self) -> EngineResult<Option<EncodedPacket>> {
         self.drain_events_nowait()?;
         if let Some(mut pkt) = self.output_queue.pop_front() {
-            // MF preserves PTS order (no B-frames; zeroReorderDelay); the
-            // most recent submit's meta corresponds to whatever we're
-            // returning now. Good enough for engine-level telemetry; the
-            // sample's own PTS is authoritative for protocol forwarding.
-            if let Some((pts_ns, submit_instant, _)) = self.pending_input_meta.take() {
+            // MF preserves output order (no B-frames; zero-reorder MFT) so
+            // the head of the meta FIFO matches the head of the output
+            // queue. If they ever fall out of sync (e.g., a hot reset
+            // that drained outputs without pairing meta), leave encode_us
+            // as None rather than mis-stamping.
+            if let Some((pts_ns, submit_instant)) = self.pending_input_meta.pop_front() {
                 pkt.pts_ns = pts_ns;
                 let us = submit_instant.elapsed().as_micros();
                 pkt.encode_us = Some(us.min(u32::MAX as u128) as u32);
