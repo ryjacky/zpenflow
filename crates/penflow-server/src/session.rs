@@ -229,9 +229,18 @@ impl Session {
                 vdd.instance_id()
             );
             vdd.enable()?;
-            // Windows takes ~100-500 ms to publish the new monitor through
-            // DXGI on this rig. 5 s is a generous upper bound.
-            let virt = wait_for_virtual_monitor(Duration::from_secs(5)).await?;
+            // Windows + the VDD driver itself can take a couple of seconds
+            // to publish the new monitor through DXGI on a cold start (it
+            // re-reads vdd_settings.xml, calls IddCxMonitorArrival,
+            // SurfaceFlinger / DWM rebuilds the monitor list). 15 s is
+            // generous; if we hit this we genuinely have a configuration
+            // problem.
+            let instance_id = vdd.instance_id().to_string();
+            let virt = wait_for_virtual_monitor(
+                Duration::from_secs(15),
+                Some(&instance_id),
+            )
+            .await?;
             eprintln!(
                 "[session] virtual monitor up: {} {}x{} on {}",
                 virt.device_name, virt.width, virt.height, virt.adapter_name

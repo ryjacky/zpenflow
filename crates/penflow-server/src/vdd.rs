@@ -137,18 +137,29 @@ pub enum VddError {
     ShellExecute(String),
 
     /// We enabled the VDD but DXGI didn't enumerate a virtual monitor
-    /// within the wait window. The error includes every monitor name we
-    /// saw during the wait so the operator can spot the case where the
-    /// monitor came up under an unexpected name.
+    /// within the wait window. Includes everything we saw so the
+    /// operator can diagnose whether (a) the monitor came up under an
+    /// unexpected name (heuristic miss), (b) the driver flipped back to
+    /// disabled mid-wait, or (c) the driver stayed healthy but never
+    /// created a monitor (vdd_settings.xml not applied / 0-monitor
+    /// fallback).
     #[error(
         "VDD enabled but DXGI didn't enumerate a virtual monitor within {timeout:?}.\n\
-         Monitors seen during the wait: {monitors_seen:?}"
+         Monitors seen during the wait: {monitors_seen:?}\n\
+         Device status timeline: {status_timeline:?}\n\
+         If the timeline shows the device stayed healthy (no DN_HAS_PROBLEM bit, problem=0)\n\
+         but no virtual monitor appeared, the driver process is running but isn't creating\n\
+         any monitor. Most common cause: C:\\VirtualDisplayDriver\\vdd_settings.xml is not\n\
+         the minimal schema the binary parses. Replace it with tools/vdd/vdd_settings.xml\n\
+         from this repo and click 'Reload Driver' in Virtual Driver Control."
     )]
     EnumerationTimeout {
         /// How long we waited before giving up.
         timeout: Duration,
         /// All distinct adapter+output labels enumerated during the wait.
         monitors_seen: Vec<String>,
+        /// Per-second snapshots of `CM_Get_DevNode_Status`.
+        status_timeline: Vec<String>,
     },
 
     /// Walking the DXGI factory raised an error.
@@ -274,13 +285,29 @@ impl Drop for VddController {
 
 /// After enabling the VDD, Windows takes a moment to publish the new
 /// monitor through DXGI. Poll the factory until a `looks_virtual`
-/// attached output appears. On timeout, report which monitors WERE
-/// visible during the wait (so the operator can spot a heuristic miss).
-pub async fn wait_for_virtual_monitor(timeout: Duration) -> Result<MonitorInfo, VddError> {
+/// attached output appears.
+///
+/// On timeout, report:
+/// - all monitors that DID appear in DXGI during the wait (heuristic
+///   miss diagnostic),
+/// - the device's PnP status checkpoints (so we can tell if the driver
+///   stayed healthy throughout the wait or flipped back to disabled
+///   somewhere in the middle).
+///
+/// `instance_id` is optional: if provided we sample CM_Get_DevNode_Status
+/// once per second during the wait so the timeout error includes the
+/// driver's status timeline.
+pub async fn wait_for_virtual_monitor(
+    timeout: Duration,
+    instance_id: Option<&str>,
+) -> Result<MonitorInfo, VddError> {
     let start = Instant::now();
     let mut all_seen: Vec<String> = Vec::new();
+    let mut status_timeline: Vec<String> = Vec::new();
     let mut last_dxgi_err: Option<String> = None;
+    let mut last_status_t = Instant::now();
     while Instant::now().duration_since(start) < timeout {
+        // Sample DXGI.
         match create_dxgi_factory() {
             Ok(factory) => match monitors::enumerate(&factory) {
                 Ok(mons) => {
@@ -303,6 +330,22 @@ pub async fn wait_for_virtual_monitor(timeout: Duration) -> Result<MonitorInfo, 
             },
             Err(e) => last_dxgi_err = Some(format!("create_dxgi_factory: {e:?}")),
         }
+
+        // Sample device status once a second.
+        if let Some(id) = instance_id {
+            if last_status_t.elapsed() >= Duration::from_secs(1) {
+                let elapsed_ms = start.elapsed().as_millis();
+                match snapshot_devnode_status(id) {
+                    Ok((s, p)) => status_timeline.push(format!(
+                        "+{elapsed_ms:>5}ms status=0x{:08x} problem=0x{:08x}",
+                        s.0, p.0
+                    )),
+                    Err(e) => status_timeline.push(format!("+{elapsed_ms:>5}ms err: {e}")),
+                }
+                last_status_t = Instant::now();
+            }
+        }
+
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     if let Some(e) = last_dxgi_err {
@@ -311,6 +354,7 @@ pub async fn wait_for_virtual_monitor(timeout: Duration) -> Result<MonitorInfo, 
         Err(VddError::EnumerationTimeout {
             timeout,
             monitors_seen: all_seen,
+            status_timeline,
         })
     }
 }
