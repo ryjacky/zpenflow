@@ -13,3 +13,16 @@ penflow-transport = { path = "../penflow-transport" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "io-util", "macros"] }
 async-trait.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+] }
+windows-core = "0.62"

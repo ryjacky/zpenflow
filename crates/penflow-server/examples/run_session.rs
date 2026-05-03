@@ -15,14 +15,46 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::process::ExitCode;
+
 use penflow_core::encoder::Codec;
 use penflow_core::Engine;
+use penflow_server::vdd;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
 use penflow_transport::Transport;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> ExitCode {
+    // VDD helper sub-mode — spawned by the unelevated parent via
+    // `ShellExecuteW("runas", ...)`. We do the requested CM_Enable_DevNode /
+    // CM_Disable_DevNode and exit. NO tokio, no engine, no transport.
+    let argv: Vec<String> = env::args().collect();
+    if argv.get(1).map(|s| s.as_str()) == Some("--vdd-helper") {
+        return vdd::helper_main(&argv[1..]);
+    }
+
+    // Normal session path runs on a tokio runtime.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[run_session] tokio runtime build failed: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match rt.block_on(run_session_main()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("[run_session] {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
 
     // Probe for a Virtual Display Driver. If it's installed (regardless of
@@ -46,13 +78,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(None) => {
                 println!(
-                    "[run_session] no VDD installed (PowerShell ran fine, no match)"
+                    "[run_session] no VDD installed (Display-class enumeration found no match)"
                 );
                 println!(
                     "[run_session]   capturing the physical monitor — see tools/vdd/README.md"
                 );
                 println!(
                     "[run_session]   (Qualcomm decoders may reject 4K streams; install VDD if so)"
+                );
+                println!(
+                    "[run_session]   tip: set PENFLOW_VDD_TRACE=1 to see all enumerated devices"
                 );
                 None
             }
