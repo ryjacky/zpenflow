@@ -71,7 +71,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         codec: Codec::Hevc,
         bitrate_bps: args.bitrate_bps,
         fps: args.fps,
-        max_touch_contacts: 10,
     };
 
     // Subscribe to lifecycle events so the operator sees them.

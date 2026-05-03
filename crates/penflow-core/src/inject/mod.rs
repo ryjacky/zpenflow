@@ -1,11 +1,18 @@
 //! Pen + touch input injection.
 //!
-//! Two backends today, both Windows-only:
-//!   - `win_ink` — WinRT `InputInjector` for pen pressure / tilt / hover /
-//!     buttons / eraser. Gate-3-proven (HANDOFF §3.3 / §5.1).
-//!   - `win_touch` — Win32 `InitializeTouchInjection` / `InjectTouchInput`
-//!     for multi-touch (snapshot diff). Penflow already does this in the
-//!     predecessor; OTD has nothing comparable on Windows.
+//! `win_ink` is the unified backend: a single WinRT
+//! `Windows.UI.Input.Preview.Injection.InputInjector` instance handles both
+//! pen pressure / tilt / hover / buttons / eraser AND multi-touch contacts.
+//! Gate-3-proven (HANDOFF §3.3 / §5.1) for the pen path; touch is the same
+//! WinRT API.
+//!
+//! Predecessor used Win32 `InjectTouchInput` for touch (HANDOFF §2.3 #3)
+//! to dodge Python `winsdk` signature ambiguities. Those don't apply to
+//! `windows-rs`, and Win32's hard thread-affinity rule (the calling thread
+//! that ran `InitializeTouchInjection` must be the only thread that ever
+//! calls `InjectTouchInput`) is incompatible with tokio's worker-thread
+//! shuffling. WinRT's `InputInjector` is **agile** so we can drive it
+//! freely from any tokio task.
 //!
 //! Cross-cutting helpers:
 //!   - `coords::AffineTransform` — input area → output area mapping.
@@ -16,8 +23,6 @@ pub mod coords;
 
 #[cfg(windows)]
 pub mod win_ink;
-#[cfg(windows)]
-pub mod win_touch;
 
 use std::time::Instant;
 

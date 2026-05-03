@@ -27,8 +27,7 @@ use tokio::sync::Mutex;
 
 use penflow_core::encoder::{Codec, EncodedPacket};
 use penflow_core::inject::coords::AffineTransform;
-use penflow_core::inject::win_ink::PenInjector;
-use penflow_core::inject::win_touch::TouchInjector;
+use penflow_core::inject::win_ink::InputInjector;
 use penflow_core::inject::{PenSample, TouchPoint, TouchState};
 use penflow_core::monitors::MonitorInfo;
 use penflow_core::Engine;
@@ -102,8 +101,6 @@ pub struct SessionConfig {
     pub bitrate_bps: u32,
     /// Encoder frame rate.
     pub fps: u32,
-    /// Maximum simultaneous touch contacts to support.
-    pub max_touch_contacts: u32,
 }
 
 impl Default for SessionConfig {
@@ -129,7 +126,6 @@ impl Default for SessionConfig {
             codec: Codec::Hevc,
             bitrate_bps: 50_000_000,
             fps: 60,
-            max_touch_contacts: 10,
         }
     }
 }
@@ -210,14 +206,13 @@ impl Session {
             .fps(self.cfg.fps)
             .start()?;
 
-        // 4. Build the input injectors and the input→output coordinate
-        //    transform. PenInjector::new sets PER_MONITOR_AWARE_V2 process-
-        //    wide so captured coords + injection coords are both physical
-        //    pixels (gate-2 §4.4b).
-        let pen = Arc::new(Mutex::new(PenInjector::new()?));
-        let touch = Arc::new(Mutex::new(TouchInjector::new(
-            self.cfg.max_touch_contacts,
-        )?));
+        // 4. Build the unified pen+touch injector and the input→output
+        //    coordinate transform. InputInjector::new sets
+        //    PER_MONITOR_AWARE_V2 process-wide so captured coords +
+        //    injection coords are both physical pixels (gate-2 §4.4b).
+        //    A single WinRT InputInjector instance handles both pen and
+        //    touch — agile object, safe to call from any tokio worker.
+        let injector = Arc::new(Mutex::new(InputInjector::new()?));
         // Map DXGI rotation enum (1=identity, 2=90°, 3=180°, 4=270°) to
         // degrees for the AffineTransform.
         let rotation_deg: u32 = match engine.monitor().rotation {
@@ -305,8 +300,7 @@ impl Session {
         let dispatch = tokio::spawn(read_loop(
             reader,
             writer.clone(),
-            pen.clone(),
-            touch.clone(),
+            injector.clone(),
             coords,
             android.display_width,
             android.display_height,
@@ -459,8 +453,7 @@ async fn telemetry_pump(
 async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: R,
     writer: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
-    pen: Arc<Mutex<PenInjector>>,
-    touch: Arc<Mutex<TouchInjector>>,
+    injector: Arc<Mutex<InputInjector>>,
     coords: AffineTransform,
     android_w: u16,
     android_h: u16,
@@ -497,8 +490,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
                     eraser: pe.tool == 1,
                     captured_at: None,
                 };
-                let mut p = pen.lock().await;
-                if let Err(e) = p.inject(&sample) {
+                let mut inj = injector.lock().await;
+                if let Err(e) = inj.inject_pen(&sample) {
                     eprintln!("[read_loop] pen inject failed: {e:?}");
                 }
             }
@@ -514,14 +507,14 @@ async fn read_loop<R: AsyncRead + Unpin>(
                             x,
                             y,
                             // Android sends only currently-down contacts;
-                            // the injector synthesises Down/Up transitions
+                            // InputInjector synthesises Down/Up transitions
                             // from the diff with the previous snapshot.
                             state: TouchState::Update,
                         }
                     })
                     .collect();
-                let mut t = touch.lock().await;
-                if let Err(e) = t.inject_snapshot(&snapshot) {
+                let mut inj = injector.lock().await;
+                if let Err(e) = inj.inject_touch(&snapshot) {
                     eprintln!("[read_loop] touch inject failed: {e:?}");
                 }
             }
