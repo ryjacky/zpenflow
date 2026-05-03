@@ -2,7 +2,9 @@
 
 **Status:** Draft (awaiting user review)
 **Date:** 2026-05-03
-**Branch:** `v1-rust`
+**Branch:** `main` in this fresh `zpenflow` repo. The predecessor repo
+`C:\repo\krita\penflow\` keeps the proven Python+C++ build on its `main`
+branch and later experimental work on `v1-rust`.
 **Supersedes:**
 - `2026-05-02-wave-1-foundation-design.md` (Wave 1 architecture — still authoritative for the Cargo workspace skeleton, but its encoder/transport details are restated here)
 - `2026-05-02-wave-2-rust-core-port-design.md` (revised 2026-05-03 to MF, but this document is the new source of truth)
@@ -21,8 +23,8 @@ Source clones live in `research/` (gitignored). Specific files referenced inline
 
 Produce v1.0 of Penflow: a cross-platform PC → Android pen-display bridge with:
 
-- **Latency**: ≤ 20 ms e2e on the user's reference setup (RTX 5070 + Wacom MovinkPad Pro 14, currently ~20 ms with the C++ build).
-- **GPU vendor coverage on Windows**: NVIDIA + AMD + Intel + software fallback. Today: NVIDIA-only.
+- **Latency**: ≤ 25 ms p50 / ≤ 35 ms p99 e2e on the user's reference setup (RTX 5070 + Wacom MovinkPad Pro 14). The predecessor C++/NVENC build reaches ~20 ms; matching that with MF is a stretch goal.
+- **GPU vendor coverage on Windows**: NVIDIA + AMD + Intel via hardware Media Foundation MFTs. Software MF encode is a diagnostic fallback only and is not expected to meet the latency target. Today: NVIDIA-only direct NVENC in the predecessor.
 - **OS coverage**: Windows now, **macOS post-v1.0** (architecture must accommodate; no shipping macOS in v1.0).
 - **Installer**: WiX MSI, ≤ 30 MB total. No bundled FFmpeg / GStreamer.
 - **First-class Krita support**: Windows Ink with pressure / tilt / 3 buttons / hover / eraser, plus multi-touch pan/zoom.
@@ -166,7 +168,15 @@ pub struct CapturedFrame {
 }
 ```
 
-Windows impl: `dxgi::DxgiCapturer` wraps `IDXGIOutputDuplication` (`IDXGIOutput5::DuplicateOutput1` preferred, with format preference `[NV12, BGRA]`; falls back to `IDXGIOutput1::DuplicateOutput`). Adopts these tricks from Sunshine `display_base.cpp`:
+Windows impl: `dxgi::DxgiCapturer` wraps `IDXGIOutputDuplication`. The predecessor `penflow` main branch creates one D3D11 device on the high-performance adapter and uses it for both DDA capture and NVENC; that worked on the reference rig because the selected VDD output appears on that adapter. The Rust port must keep this invariant explicit:
+
+- Enumerate adapters and outputs together, not as a flat monitor index detached from the adapter.
+- Create the D3D11 device from the adapter that owns the selected output; `DuplicateOutput1` fails if the device comes from a different adapter.
+- Prefer VDD outputs on the high-performance adapter so capture, BGRA→NV12 conversion, and the MF encoder share one D3D11 device. If the VDD is installed as a separate display adapter, treat that as a separate Wave-2 gate: either add a measured cross-adapter copy path or report that configuration unsupported for v1.0.
+
+`IDXGIOutput5::DuplicateOutput1` is still preferred, but its format list must contain display scan-out formats only. Use a conservative list such as `[B8G8R8A8_UNORM, R8G8B8A8_UNORM, R10G10B10A2_UNORM, R16G16B16A16_FLOAT]` and fall back to `IDXGIOutput1::DuplicateOutput`. Do **not** put `NV12` in the DDA format preference list; convert to NV12 in `color.rs`.
+
+Adopts these tricks from Sunshine `display_base.cpp`:
 
 - `SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED)` per session — without this, idle desktop sleeps, AcquireNextFrame returns `DXGI_ERROR_ACCESS_LOST`, reinit wakes the monitor → infinite cycle. (Sunshine `display_base.cpp:239`.)
 - `IDXGIDevice1::SetMaximumFrameLatency(1)` to keep the swap chain queue at depth 1.
@@ -181,13 +191,13 @@ We **do not** copy:
 
 ### 6.2 Color Conversion (`color.rs`)
 
-DXGI gives BGRA. MF HEVC encoders prefer NV12. We **do not** roll HLSL shaders (Sunshine's path is ~1000 LOC of HLSL+C++); we use **D3D11 VideoProcessor** (`ID3D11VideoProcessor`, `IDXGIVideoProcessorEnumerator`, `ID3D11VideoContext::VideoProcessorBlt`). This is a Microsoft-supplied, driver-accelerated path that does BGRA→NV12 in 0.1–0.3 ms with full colour-matrix control (BT.709, full range).
+DXGI usually gives BGRA, and `DuplicateOutput1` may also return high-colour scan-out formats such as R10G10B10A2. MF HEVC encoders generally prefer NV12. We **do not** roll HLSL shaders (Sunshine's path is ~1000 LOC of HLSL+C++); we use **D3D11 VideoProcessor** (`ID3D11VideoProcessor`, `IDXGIVideoProcessorEnumerator`, `ID3D11VideoContext::VideoProcessorBlt`). This is a Microsoft-supplied, driver-accelerated path that does scan-out-format→NV12 in roughly the same budget as the predecessor's GPU-only hot path, with full colour-matrix control (BT.709, full range).
 
 Output side configuration:
 - `D3D11_VIDEO_PROCESSOR_OUTPUT_RATE` = `NORMAL`
 - Color space = `DXGI_COLOR_SPACE_YCBCR_FULL_G22_NONE_P709` (full-range BT.709)
 
-If a backend turns out to accept BGRA directly (some MF encoders do, e.g. ARGB32 input format), we skip the converter for that path. Probe at session init.
+If a backend accepts the captured scan-out format directly (some MF encoders accept ARGB32), we may skip the converter only after the live probe proves that path encodes and the Android output remains colour-correct. The default path is DDA scan-out format → VideoProcessor NV12 → MF.
 
 ### 6.3 Encoder Abstraction (Sunshine-inspired)
 
@@ -215,7 +225,7 @@ pub trait EncodeSession: Send {
 }
 ```
 
-Backend probe order (Windows): `mf` first; future hooks reserve room for `videotoolbox` on macOS. **No FFmpeg fallback in v1.0** — if MF fails to find any hardware encoder, we report a hard error rather than ship a 30 MB fallback for an unlikely case.
+Backend probe order (Windows): `mf` first; future hooks reserve room for `videotoolbox` on macOS. **No FFmpeg fallback in v1.0** — if MF fails to find a hardware encoder that passes the live probe, we report a hard error for the latency product path rather than ship a 30 MB fallback. A Microsoft software MFT can be tried as a diagnostic path, but it is not part of the v1.0 latency acceptance.
 
 Probe is a **live test**, not just enumeration: we call `make_session` with a tiny config, encode one black frame, and only then mark the backend `passed`. Sunshine does this (`probe_encoders`, `src/video.cpp:2793`) for the same reason — driver capability strings lie.
 
@@ -231,10 +241,10 @@ Probe is a **live test**, not just enumeration: we call `make_session` with a ti
 - Codec API attributes via `ICodecAPI`:
   - `CODECAPI_AVEncCommonRateControlMode = eAVEncCommonRateControlMode_CBR`
   - `CODECAPI_AVEncCommonMeanBitRate` (50 Mbps default)
-  - `CODECAPI_AVEncCommonLowLatency = VARIANT_TRUE`
+  - `CODECAPI_AVLowLatencyMode` with `VT_BOOL / VARIANT_TRUE` if supported by the chosen MFT
   - `CODECAPI_AVEncMPVDefaultBPictureCount = 0`
   - `CODECAPI_AVEncH264CABACEnable / CABAC` → not applicable to HEVC
-  - `CODECAPI_AVEncVideoForceKeyFrame` for on-demand IDR (see §6.4.1)
+  - `CODECAPI_AVEncVideoForceKeyFrame` for on-demand IDR (see §6.4.1). This property is `ULONG` / `VT_UI4`; set `ulVal = 1` before the frame that should become keyframe. Do **not** use a `VT_BOOL` / `VARIANT_TRUE` value here.
   - `CODECAPI_AVEncVideoIntraRefreshMode`, `CODECAPI_AVEncVideoIntraRefreshPeriod`, `CODECAPI_AVEncVideoIntraRefreshFrameCount` — set best-effort; if the driver rejects them we accept periodic IDR fallback.
 - VUI / colour metadata via media-type attributes:
   - `MF_MT_VIDEO_NOMINAL_RANGE = MFNominalRange_0_255` (full range)
@@ -244,13 +254,18 @@ Probe is a **live test**, not just enumeration: we call `make_session` with a ti
 - D3D11 binding via `MFCreateDXGIDeviceManager` + `IMFTransform::ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, ...)`. Captured textures are wrapped in `IMFSample` via `MFCreateDXGISurfaceBuffer + MFCreateSample`. Zero-copy GPU path.
 - Encode loop is sync-style for the caller (`submit_frame` then `poll_packet`) but uses MF's async-MFT event model internally: `IMFMediaEventGenerator::GetEvent` for `METransformNeedInput` / `METransformHaveOutput` events, drained between submit/poll calls.
 
-#### 6.4.1 On-demand IDR — the open question
+#### 6.4.1 On-demand IDR — verified on NVIDIA (2026-05-03)
 
-Sunshine reports (`src/video.cpp:886`) that **FFmpeg's `hevc_mf` codec wrapper** sets `FIXED_GOP_SIZE` because it cannot do on-demand IDR. This may or may not be a limitation of MF itself or only of FFmpeg's wrapping. Microsoft's documentation lists `CODECAPI_AVEncVideoForceKeyFrame` as supported on the Windows H.264/HEVC encoder MFTs.
+Sunshine reports (`src/video.cpp:886`) that **FFmpeg's `hevc_mf` codec wrapper** sets `FIXED_GOP_SIZE` because it cannot do on-demand IDR. We verified that this is a limitation of FFmpeg's wrapping, **not** of MF itself: `crates/penflow-core/examples/mf_idr_probe.rs` directly drives the NVIDIA HEVC encoder MFT, sets `CODECAPI_AVEncVideoForceKeyFrame` with `VARIANT.vt = VT_UI4` / `ulVal = 1` before submitting frame N, and frame N comes out as an IDR (HEVC NAL type 19, `IDR_W_RADL`) — stably across multiple runs. The design holds; the engine uses on-demand IDR.
 
-**Test-before-depend gate**: before committing to MF as the sole Windows path, verify `CODECAPI_AVEncVideoForceKeyFrame` actually produces an IDR within the next frame on at least NVIDIA + AMD + Intel MFTs. If it works, we keep the design as written. If it doesn't, we accept periodic IDR (every N seconds) and add an "on connect" forced reset; the worst case is the cold-start cost a connecting client pays for one IDR period.
+The same probe needs to be re-run on AMD and Intel MFTs once those adapters are available. If either fails, the fallback is periodic IDR (every N seconds) plus an "on connect, reset encoder" path — the only cost is the cold-start IDR a connecting client pays for one IDR period. The encoder backend abstraction (§6.3) already exposes `request_idr` so this fallback can live entirely behind the MF backend.
 
-This gate runs **once during Wave 2 implementation**, before locking the design.
+**Other findings the probe baked in (now load-bearing for `encoder/mf.rs`):**
+- `MFTEnumEx` returns vendor MFTs system-wide regardless of which GPU is physically present. On the dev rig (NVIDIA-only), the merit-sorted list returned `AMDh265Encoder` first and `NVIDIA HEVC Encoder MFT` second. Activating the wrong-vendor MFT against the NVIDIA D3D11 device fails with `E_OUTOFMEMORY` (0x8007000E) at `MFT_MESSAGE_SET_D3D_MANAGER`. The encoder backend MUST match MFTs by `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute` (the `VEN_XXXX` string) against the active D3D11 adapter's `DXGI_ADAPTER_DESC1::VendorId`, then live-probe in order, before activating.
+- `MF_TRANSFORM_ASYNC_UNLOCK = 1` MUST be set on the MFT's `IMFAttributes` **before** any other call. Otherwise `SET_D3D_MANAGER` and `SetOutputType` return `MF_E_TRANSFORM_ASYNC_LOCKED` (0xC00D6D77).
+- The HEVC output media type requires `MF_MT_MPEG2_PROFILE` (use `eAVEncH265VProfile_Main_420_8` = 1) in addition to the obvious size/rate/subtype attributes. Without it `SetOutputType` returns `MF_E_INVALIDMEDIATYPE` (0xC00D36B4).
+- Color-space attributes (`MF_MT_VIDEO_NOMINAL_RANGE`, `_PRIMARIES`, `_TRANSFER_FUNCTION`, `_YUV_MATRIX`) belong on the **input** media type, not the output type. The encoder reads them and writes the corresponding VUI bytes into the SPS.
+- NVIDIA's MFT emits an Access Unit Delimiter (NAL type 35) at the start of every access unit, and re-emits VPS/SPS/PPS on every IDR. Both are harmless — Android's MediaCodec ignores AUDs, and repeated parameter sets give us free `repeatSPSPPS = 1`.
 
 ### 6.5 macOS Encoder Hook (post-v1.0)
 
@@ -267,7 +282,13 @@ This shape matches the Windows side intentionally so the engine API stays unifor
 
 ### 6.6 Pen + Touch Injection
 
-Penflow's WinRT `InputInjector`-based pen injection already exceeds OpenTabletDriver's Windows backend. From OTD we adopt only:
+Penflow's WinRT `InputInjector`-based pen injection already exceeds OpenTabletDriver's Windows backend. The predecessor `penflow` main branch proves the `winsdk.windows.ui.input.preview.injection.InputInjector` path works on the reference machine as an unpackaged Python process and that Krita receives Windows Ink pressure/tilt. Microsoft documentation still marks this namespace as requiring the `inputInjectionBrokered` restricted capability for Windows apps, so the Rust rewrite needs a release-shape gate before we call the MSI path locked:
+
+1. Build a minimal unpackaged Rust/Tauri probe that calls `InputInjector::TryCreate`, initializes pen injection, sends pressure/tilt samples, and verifies Krita sees pressure.
+2. Build the same probe through the intended release packaging path (WiX MSI unless changed) and verify it still works without MSIX restricted capability declarations.
+3. If the packaged probe fails, decide between MSIX-with-capability, a small broker process, or a virtual HID/driver route. `SendInput` mouse fallback stays diagnostic only; it is not an acceptable v1.0 pressure path.
+
+From OTD we adopt only:
 
 - `SetProcessDpiAwareness(2)` (`PROCESS_PER_MONITOR_DPI_AWARE`) at startup so virtual-screen geometry is in physical pixels.
 - A `Matrix3x2`-style input-area → output-area transform (replace the current naive `left + norm * width`):
@@ -298,7 +319,9 @@ Touch injection (Win32 `InitializeTouchInjection` + `InjectTouchInput`) keeps it
 
 `[u8 msg_id][u32 BE length][payload of `length` bytes]`. Already better than scrcpy's no-length-prefix raw scheme: an unknown message is a single `read_exact` skip, not a parser-desync recovery problem.
 
-### 7.2 Message catalogue (unchanged from current `protocol.py`)
+### 7.2 Message catalogue
+
+Base IDs match the predecessor `protocol.py`; `REQUEST_IDR` is the one v1.0 addition needed by the decoder recovery ladder.
 
 | ID | Name | Direction | Purpose |
 |---|---|---|---|
@@ -313,6 +336,7 @@ Touch injection (Win32 `InitializeTouchInjection` + `InjectTouchInput`) keeps it
 | 0x82 | `PEN_EVENT` | client → server | Pen sample |
 | 0x83 | `TOUCH_EVENT` | client → server | Multi-finger snapshot |
 | 0x84 | `TIME_SYNC_REQ` | client → server | NTP-style request |
+| 0x85 | `REQUEST_IDR` | client → server | Decoder recovery asks server for the next recoverable frame |
 | 0xFF | `ANDROID_GOODBYE` | client → server | Clean shutdown notice |
 
 Direction encoding by high bit (already in place): server→client < 0x80; client→server ≥ 0x80.
@@ -408,12 +432,12 @@ otherwise:
 Also add (Qualcomm only, API ≥ 26):
 - `vendor.qti-ext-dec-picture-order.enable = 1` — disables HEVC reorder buffering (moonlight finding; saves 5–10 ms).
 
-Other vendor keys to add unconditionally (silently ignored on wrong vendor):
+Other vendor keys to try in a codec-specific ladder, not all at once:
 - `vendor.hisi-ext-low-latency-video-dec.video-scene-for-low-latency-req = 1` (Kirin)
 - `vendor.rtc-ext-dec-low-latency.enable = 1` (Samsung Exynos)
 - `vendor.low-latency.enable = 1` (Amlogic)
 
-API ≥ 31: probe `getSupportedVendorParameters()` and only set the ones the codec advertises.
+API ≥ 31: probe `getSupportedVendorParameters()` and only set the ones the codec advertises. API < 31: follow Moonlight's pattern — try a narrow vendor-specific format, catch `configure()` failure, remove the last vendor hint, and retry. Do not assume unknown vendor keys are always ignored by every vendor codec.
 
 ### 10.3 Codec recovery ladder
 
@@ -436,6 +460,11 @@ private fun recover() {
 
 After `Reinit` fails, escalate to disconnect + bubble error to UI.
 
+`requestIdrFromServer()` sends `MSG_REQUEST_IDR` (`0x85`). Server behaviour:
+- If the MF IDR gate passed for the active encoder, set `force_idr` on the next submitted frame.
+- If not, reset the encoder session and resend `VIDEO_CONFIG`, or wait for the next periodic IDR depending on the fallback mode selected by §6.4.1.
+- The Android client must accept a mid-stream `VIDEO_CONFIG` after recovery.
+
 ### 10.4 Decoder-hung watchdog
 
 5-second timeout on `dequeueInputBuffer` (or in async-mode equivalent: time-since-last-`onInputBufferAvailable`). On expiry, treat as decoder hung → trigger recovery ladder.
@@ -449,23 +478,42 @@ Currently `waitForSurface()` only spin-waits at startup. Add `SurfaceHolder.Call
 
 ### 10.6 Frame pacing — MIN_LATENCY mode
 
-Replace `releaseOutputBuffer(index, true)` with moonlight's MIN_LATENCY pattern:
+Replace `releaseOutputBuffer(index, true)` with an async-safe MIN_LATENCY pattern. Do **not** call `dequeueOutputBuffer()` from inside a `MediaCodec.Callback`; Android's async mode owns output-buffer delivery through callbacks and the synchronous dequeue APIs are invalid in that mode.
 
 ```kotlin
+private val codecHandler = Handler(codecThread.looper) // same handler passed to setCallback
+private val outputLock = Any()
+private var newestOutputIndex: Int? = null
+private var renderPosted = false
+
 override fun onOutputBufferAvailable(codec: MediaCodec, index: Int, info: BufferInfo) {
-    // drain any further output buffers; keep only newest, drop the rest
-    while (true) {
-        val nextIdx = codec.dequeueOutputBuffer(scratchInfo, 0L)
-        if (nextIdx < 0) break
-        codec.releaseOutputBuffer(index, false)  // drop previous late frame
-        index = nextIdx
-        info = scratchInfo
+    var dropped: Int? = null
+    var shouldPostRender = false
+    synchronized(outputLock) {
+        dropped = newestOutputIndex
+        newestOutputIndex = index
+        if (!renderPosted) {
+            renderPosted = true
+            shouldPostRender = true
+        }
     }
-    codec.releaseOutputBuffer(index, System.nanoTime())  // wall-clock PTS = SurfaceFlinger drop policy
+    dropped?.let { codec.releaseOutputBuffer(it, false) }
+
+    if (shouldPostRender) {
+        codecHandler.post {
+            val toRender: Int? = synchronized(outputLock) {
+                val chosen = newestOutputIndex
+                newestOutputIndex = null
+                renderPosted = false
+                chosen
+            }
+            toRender?.let { codec.releaseOutputBuffer(it, System.nanoTime()) }
+        }
+    }
 }
 ```
 
-Passing `System.nanoTime()` as the render PTS lets SurfaceFlinger drop the frame if a newer one arrives within the same vsync — exactly what we want for a pen display under load.
+This is the async equivalent of Moonlight's sync-loop drain: callback bursts coalesce to the newest output index, older indices are released with `render=false`, and the render release happens on the same codec handler. Passing `System.nanoTime()` as the render PTS lets SurfaceFlinger schedule for the next vsync and drop late buffers if the Surface queue is superseded under load.
 
 ### 10.7 Pen capture polish
 
@@ -487,7 +535,6 @@ Tauri 2.x scaffold from Wave 1 stands. Wave 4 fills in:
 - Monitor picker (uses `Engine::list_monitors()`).
 - Codec / bitrate sliders.
 - Pen-button binding UI (renders the new `Binding` enum from §6.6 as dropdowns).
-- Side-button binding UI maps to `binding.rs`'s data model.
 - Dev HUD toggle.
 - Status / connection state.
 - Per-vendor encoder picker (advanced; default = first probe-validated backend).
@@ -508,7 +555,9 @@ VDD on-demand monitor lifecycle (from Wave 1 spec, retained):
 - Android client connects → server commands VDD over named pipe to plug in a monitor with the negotiated EDID.
 - Android disconnects / GUI quits → unplug.
 
-Pinned VDD fork: lock to a specific commit of [itsmikethetech/Virtual-Display-Driver](https://github.com/itsmikethetech/Virtual-Display-Driver) whose IPC supports runtime plug/unplug (verify before locking; that fork's IPC has changed historically).
+VDD source currently proven by the predecessor main branch: [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver), release `25.7.23`, with the minimal `tools/vdd/vdd_settings.xml` schema. That path creates a stable virtual monitor after manual install/reload, but it does **not** by itself prove runtime plug/unplug IPC.
+
+Wave 5 gate: identify and pin the exact VDD control path that supports runtime monitor arrival/departure. If the VirtualDrivers release exposes a supported control mechanism, use that pinned release. If not, evaluate a fork or a tiny companion service. Do not claim on-demand VDD lifecycle implemented until a script can plug, enumerate, capture, unplug, and re-enumerate without manual Virtual Driver Control interaction.
 
 ## 13. CI
 
@@ -522,17 +571,20 @@ Wave 6 adds release pipeline: tag → MSI artifact, tag → Android APK artifact
 
 ## 14. Branching
 
-- `main`: Python + C++ working build. Untouched until Wave 6.
-- `v1-rust`: all v1.0 work. Wave 6 final step merges back, tag `v1.0.0`.
+- `zpenflow/main`: current Rust + Tauri rewrite workspace.
+- `C:\repo\krita\penflow` predecessor:
+  - `main`: working Python + C++ NVENC build, used as the reference oracle.
+  - `v1-rust`: later experimental branch; do not treat it as the proven runtime baseline unless explicitly checking newer design notes.
 
 ## 15. Risks and Mitigations
 
 | Risk | Mitigation |
 |---|---|
 | MF's `CODECAPI_AVEncVideoForceKeyFrame` doesn't actually deliver IDR-on-demand on AMD/Intel MFTs | Explicit Wave-2 gate test before locking design (§6.4.1). Fallback: periodic IDR + on-connect reset. |
-| Per-vendor MFT bugs (Intel iGPU known-buggy on certain Intel UHD generations) | `EncoderBackend::make_session` does live black-frame probe; Tauri GUI lets the user pick a non-default backend. Software fallback (`hevc_amf` is technically AMD-only but Microsoft ships a software MFT — try it last). |
+| Per-vendor MFT bugs (Intel iGPU known-buggy on certain Intel UHD generations) | `EncoderBackend::make_session` does live black-frame probe; Tauri GUI lets the user pick a non-default hardware MFT. Software MF encode is diagnostic only and does not count toward v1.0 latency acceptance. |
 | Adreno 620 crash from `KEY_OPERATING_RATE + KEY_PRIORITY=0` (latent today) | §10.2 fix lands in Android client first thing in Wave 3. |
-| VDD upstream IPC changes break our plug/unplug | Vendored at a pinned commit in Wave 5. Decision to fork or contribute deferred. |
+| `InputInjector` works in the predecessor Python process but fails in the final Rust/Tauri/WiX release shape | Add a Wave-2 injection packaging probe before installer work. If WiX cannot use this restricted API reliably, switch packaging/broker/virtual-HID strategy before v1.0. |
+| VDD dynamic plug/unplug is not proven by the predecessor's manual Virtual Driver Control workflow | Wave-5 gate pins an exact control mechanism and proves plug/enumerate/capture/unplug by script before installer acceptance. |
 | WiX MSI total size exceeds 30 MB target | Strip Tauri to minimum features (no devtools in release builds). VDD bundle only the signed binaries needed (no source). |
 | ADB `reverse` denied on locked-down corporate machines | Document the requirement; out of scope to work around for v1.0. |
 
@@ -541,7 +593,7 @@ Wave 6 adds release pipeline: tag → MSI artifact, tag → Android APK artifact
 | Wave | Scope | Status |
 |---|---|---|
 | 1 | Cargo workspace + Tauri skeleton + Transport trait + CI | ✅ done |
-| 2 | `penflow-core`: capture + encoder (MF) + inject. Includes the §6.4.1 IDR gate test. | revised, in progress |
+| 2 | `penflow-core`: capture + encoder (MF) + inject. Includes gates for MF IDR, adapter/VDD topology, and Rust/Tauri `InputInjector` packaging. | revised, in progress |
 | 3 | `penflow-server`: tokio session orchestrator + protocol round-trip. Android-side fixes from §10.2–10.6. | next |
 | 4 | Tauri GUI features (monitor picker, codec/bitrate, button binding UI, HUD toggle). | future |
 | 5 | WiX MSI + bundled VDD + on-demand monitor lifecycle. | future |
@@ -551,11 +603,13 @@ Wave 6 adds release pipeline: tag → MSI artifact, tag → Android APK artifact
 
 ## 17. Open Questions
 
-1. **§6.4.1 IDR gate**: confirmed at Wave 2 implementation time, not now.
-2. **macOS pen injection target**: WWDC has `CGEvent` for mouse / pointing; pressure injection on macOS is historically thinner than Windows Ink. Defer concrete API choice to the macOS wave.
-3. **Multi-monitor source on PC**: today the user picks one monitor index. A future wave could let the GUI live-switch source monitor mid-session — orthogonal to v1.0.
-4. **Configurable pressure curve**: out for v1.0; identity mapping + tip threshold is sufficient for the current setup. Can be added in `binding.rs` post-ship.
-5. **Crash reporting / telemetry**: no opt-in crash reporter in v1.0. Local logs only.
+1. **§6.4.1 IDR gate**: confirmed at Wave 2 implementation time with `VT_UI4`, not now.
+2. **Rust/Tauri `InputInjector` release shape**: predecessor Python main proves the API path works on the dev rig; the Rust/WiX release shape still needs a probe because Microsoft documents a restricted capability requirement.
+3. **VDD runtime lifecycle control**: predecessor main proves manual install + stable VDD capture, not dynamic plug/unplug.
+4. **macOS pen injection target**: WWDC has `CGEvent` for mouse / pointing; pressure injection on macOS is historically thinner than Windows Ink. Defer concrete API choice to the macOS wave.
+5. **Multi-monitor source on PC**: today the user picks one monitor index. A future wave could let the GUI live-switch source monitor mid-session — orthogonal to v1.0.
+6. **Configurable pressure curve**: out for v1.0; identity mapping + tip threshold is sufficient for the current setup. Can be added in `binding.rs` post-ship.
+7. **Crash reporting / telemetry**: no opt-in crash reporter in v1.0. Local logs only.
 
 ## 18. Acceptance Gate (v1.0)
 

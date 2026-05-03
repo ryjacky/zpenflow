@@ -10,7 +10,7 @@ The goal: **don't re-make mistakes that were already made**. There are several n
 
 - **Product**: PC → Android pen-display bridge. Drives a Wacom MovinkPad Pro 14 (or any Android tablet) as a Wintab/Windows-Ink pen display for Krita-style drawing on Windows.
 - **Predecessor project**: `C:\repo\krita\penflow\` — Python server + C++ NVENC engine + Kotlin Android client. **Working build, ~20 ms e2e latency**. Kept on disk as reference; do not delete.
-- **Current project (this one)**: `C:\repo\krita\zpenflow\` — clean Rust + Tauri rewrite, fresh git repo, day 1 (initial commit `f2c9d63`).
+- **Current project (this one)**: `C:\repo\krita\zpenflow\` — clean Rust + Tauri rewrite, fresh git repo on `main` (initial commit `f2c9d63`).
 - **What's already done**: empty Cargo workspace skeleton (4 crates), Tauri 2.x window scaffold, Android client copied from predecessor (mature; needs targeted polish), CI workflow, [`design.md`](design.md) with full architecture.
 - **What's not done**: literally everything in `penflow-core` (capture/encode/inject) and `penflow-server` (session orchestrator). Engine implementation is the next milestone.
 
@@ -64,7 +64,7 @@ Sunshine (`research/sunshine/`) is the gold standard for low-latency desktop str
 | `IDXGIDevice1::SetMaximumFrameLatency(1)` | Swap chain queues frames; you eat queueing latency you can't see. |
 | `IDXGIDevice::SetGPUThreadPriority(7)` + `D3DKMTSetProcessSchedulingPriorityClass(REALTIME)` | Frame timing jitters under contention. (HIGH on NVIDIA + HAGS to dodge a documented driver crash.) |
 | 200 ms `AcquireNextFrame` timeout → 10 ms `sleep` *without* holding the D3D11 device lock | Encoder thread starves when capture is idle. |
-| `IDXGIOutput5::DuplicateOutput1` with format preference list `[NV12, BGRA]` (fall back to `IDXGIOutput1::DuplicateOutput`) | Some scenarios force unnecessary BGRA→NV12 conversion. |
+| `IDXGIOutput5::DuplicateOutput1` with a scan-out format preference list such as `[B8G8R8A8_UNORM, R8G8B8A8_UNORM, R10G10B10A2_UNORM, R16G16B16A16_FLOAT]` (fall back to `IDXGIOutput1::DuplicateOutput`) | Avoids unnecessary conversion when fullscreen content is not BGRA. Do **not** request `NV12` here; DDA format lists must be display scan-out formats. Convert to NV12 in `color.rs`. |
 
 **Skip** (out of scope for our setup):
 - Their MinHook on `NtGdiDdDDIGetCachedHybridQueryValue` — only matters on hybrid-GPU laptops; user's rig is desktop + dGPU.
@@ -152,7 +152,7 @@ The predecessor project (`C:\repo\krita\penflow\`) went through six phases over 
 
 - **RTX 5070 + NVENC**: HEVC P1 ULTRA_LOW_LATENCY hits ~2-3 ms encode for 2560×1440. Tested on driver 555.x+. Older drivers (<540) lacked some intra-refresh slice modes we used.
 
-- **VDD (Virtual Display Driver)**: We use [itsmikethetech/Virtual-Display-Driver](https://github.com/itsmikethetech/Virtual-Display-Driver) to create a virtual extended monitor matching the MovinkPad's exact 2880×1800 native resolution, eliminating letterbox. **Critical pitfall**: the upstream `vdd_settings.xml` schema has HDR/auto_resolutions sections that **crash mttvdd.dll with `WUDFUnhandledException c0000005`** on our rig. The working schema is in `tools/vdd/vdd_settings.xml` — minimal, just `monitors/gpu/global/resolutions`. Do not regenerate from upstream defaults without testing.
+- **VDD (Virtual Display Driver)**: The proven predecessor-main path uses [VirtualDrivers/Virtual-Display-Driver](https://github.com/VirtualDrivers/Virtual-Display-Driver) release `25.7.23` to create a virtual extended monitor matching the MovinkPad's exact 2880×1800 native resolution, eliminating letterbox. **Critical pitfall**: the upstream `vdd_settings.xml` schema has HDR/auto_resolutions sections that **crash mttvdd.dll with `WUDFUnhandledException c0000005`** on our rig. The working schema is in `tools/vdd/vdd_settings.xml` — minimal, just `monitors/gpu/global/resolutions`. Do not regenerate from upstream defaults without testing.
 
 ### 2.2 Phase-by-phase journey (what was tried, what stuck)
 
@@ -243,25 +243,15 @@ The rewrite target is slightly more conservative than the predecessor's measured
 - USB 2.0 ADB tunnel sustains ~280 Mbps headroom. 50 Mbps fits comfortably.
 - VBV buffer = `bitrate / fps * 2` (4-frame buffer). Tight enough to limit IDR overshoot, loose enough to absorb intra-refresh waves.
 
-### 3.3 The §6.4.1 IDR gate — open technical question
+### 3.3 The §6.4.1 IDR gate — VERIFIED on NVIDIA (2026-05-03)
 
-[`design.md`](design.md) §6.4.1 calls out the most important open question: **does Windows Media Foundation's HEVC encoder MFT actually deliver an IDR frame on demand when we set `CODECAPI_AVEncVideoForceKeyFrame`?**
+Result: **PASS on NVIDIA HEVC Encoder MFT (RTX 5070).** `crates/penflow-core/examples/mf_idr_probe.rs` directly drives the MFT, sets `CODECAPI_AVEncVideoForceKeyFrame` with `VARIANT.vt = VT_UI4 / ulVal = 1` before submitting frame N, and frame N comes out as an IDR (HEVC NAL type 19, `IDR_W_RADL`) — stable across runs. The design (§6.4.1) holds; the engine uses on-demand IDR.
 
-Sunshine (`research/sunshine/src/video.cpp:886`) notes that **FFmpeg's `hevc_mf` codec** sets `FIXED_GOP_SIZE` because *FFmpeg's wrapper* can't do on-demand IDR. This may or may not be a limitation of MF itself or only of FFmpeg's wrapping. Microsoft documents `CODECAPI_AVEncVideoForceKeyFrame` as supported on the Windows H.264/HEVC encoder MFTs.
+Still to verify on AMD and Intel MFTs once we have those adapters. If either fails, the §6.4.1 fallback (periodic IDR + on-connect reset) takes over; not a design-altering risk.
 
-**This needs to be verified before we lock the design**. The verification is a small, focused test:
+The probe also surfaced four other gotchas worth knowing before you touch `encoder/mf.rs` — captured in §4.6 below.
 
-1. Open an `IMFTransform` for `MFVideoFormat_HEVC` via `MFTEnumEx`.
-2. Configure with `MF_LOW_LATENCY`, set input/output media types.
-3. Bind D3D11 device manager.
-4. Submit ~10 frames at 60 fps. Measure where IDR frames land naturally.
-5. On frame N, set `CODECAPI_AVEncVideoForceKeyFrame = VARIANT_TRUE` via `ICodecAPI`.
-6. Submit frame N+1. Inspect the output bitstream — is the next NAL an IDR (NAL unit type 19/20 for HEVC)?
-
-If yes: design holds, build the engine.
-If no: fall back to **periodic IDR every N seconds** + an "on connect, reset encoder" path. Slightly worse cold-reconnect cost but otherwise fine.
-
-**Do this test first, before any other engine implementation.** A standalone `cargo run --example mf_idr_probe` is the right shape.
+Run it yourself: `cargo run -p penflow-core --example mf_idr_probe`. Exit 0 = PASS, 1 = no IDR after force, 2 = setup error.
 
 ### 3.4 Specific NVENC tuning the predecessor used
 
@@ -335,11 +325,35 @@ If you find yourself wanting any of these, **stop and re-read [`design.md`](desi
 - ADB on Windows holds onto a USB endpoint; if `adb kill-server` is called mid-session, the next session needs `adb usb` + `adb devices` to re-enumerate.
 - Wireless ADB (TCP/IP mode) was tested briefly in predecessor; latency suffered (+30 ms variance). Stick to USB for v1.0.
 
-### 4.5 VDD — virtual display lifecycle
+### 4.4b DXGI adapter / topology gotchas (from the gate-2 probe)
+
+`crates/penflow-core/examples/adapter_topology.rs` mapped the DXGI surface on the dev rig and turned up three things worth pinning down before `capture/dxgi.rs` starts:
+
+1. **`IDXGIOutput5::DuplicateOutput1` with a single-format list (just `B8G8R8A8_UNORM`) failed silently and made the probe fall back to `IDXGIOutput1::DuplicateOutput`.** Using the design's full 4-format list (`B8G8R8A8_UNORM, R8G8B8A8_UNORM, R10G10B10A2_UNORM, R16G16B16A16_FLOAT`) made it succeed first try. The instruction in `design.md` §6.1 to use this exact list is load-bearing — don't trim it.
+2. **Modern NVIDIA drivers expose one logical DXGI adapter per engine.** On RTX 5070, `EnumAdapters1` returned three identical "NVIDIA GeForce RTX 5070" entries with different LUIDs (only the first owns the desktop outputs); the others are compute/encode/decode-only. This means `EnumAdapterByGpuPreference(_, HIGH_PERFORMANCE)` could return an output-less adapter on a different system. **Use LUID for adapter equality** (description + vendor + device ID are not unique), and have the engine verify the picked adapter owns at least one output before treating it as the capture device.
+3. **DXGI output dimensions depend on whether the process is DPI-aware.** The probe reported 2560×1440 in the first run (no manifest) and 3840×2160 in the second run on the same physical 4K monitor with 150 % Windows scaling. The OTD-derived rule in `design.md` §6.6 (`SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)` at startup) is mandatory, not just nice-to-have — without it the capturer reads scaled DIPs and the injector will land coordinates in the wrong place.
+
+VDD wasn't installed on the rig at probe time, so the probe could only report "no virtual-display indicators". The VDD-on-high-perf-adapter check is in the probe and will trigger automatically once the VDD is present.
+
+### 4.5 Media Foundation HEVC encoder gotchas (from the §3.3 probe)
+
+These are non-obvious failure modes the probe hit on the way to a PASS. Each costs hours if you discover it on the encoder hot path.
+
+1. **Vendor MFTs are registered system-wide, regardless of which GPU is physically present.** On the dev rig (NVIDIA-only desktop), `MFTEnumEx` with `MFT_ENUM_FLAG_HARDWARE | SORTANDFILTER` returned `AMDh265Encoder` first and `NVIDIA HEVC Encoder MFT` second. Activating the wrong-vendor MFT against the NVIDIA D3D11 device fails with `E_OUTOFMEMORY` (0x8007000E) at `MFT_MESSAGE_SET_D3D_MANAGER`. **Filter MFTs by `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute`** (returns a `VEN_XXXX` string — `VEN_10DE` for NVIDIA, `VEN_1002` for AMD, `VEN_8086` for Intel) and match against the adapter's `DXGI_ADAPTER_DESC1::VendorId`. Then live-probe in order, since the vendor-ID attribute may be missing on some MFTs.
+
+2. **`MF_TRANSFORM_ASYNC_UNLOCK = 1` must be set BEFORE any other call on the MFT.** Otherwise `SET_D3D_MANAGER` and `SetOutputType` return `MF_E_TRANSFORM_ASYNC_LOCKED` (0xC00D6D77). The order is: GetAttributes → SetUINT32(`MF_TRANSFORM_ASYNC_UNLOCK`, 1) → SetUINT32(`MF_LOW_LATENCY`, 1) → SET_D3D_MANAGER → SetOutputType → SetInputType.
+
+3. **The HEVC output media type requires `MF_MT_MPEG2_PROFILE`.** Use `eAVEncH265VProfile_Main_420_8` (= 1). Without it `SetOutputType` returns `MF_E_INVALIDMEDIATYPE` (0xC00D36B4) — generic enough to send you on a long debugging tour.
+
+4. **Color-space attributes (`MF_MT_VIDEO_NOMINAL_RANGE`, `_PRIMARIES`, `_TRANSFER_FUNCTION`, `_YUV_MATRIX`) belong on the INPUT type, not the OUTPUT type.** The encoder reads them and writes the corresponding VUI bytes into the SPS. Setting them on output type is a no-op at best, an error at worst on some MFTs.
+
+5. **NVIDIA's MFT emits AUD NALs (type 35) at the start of every access unit, and re-emits VPS+SPS+PPS on every IDR.** Both are harmless — Android's MediaCodec ignores AUDs, and repeated parameter sets give us free `repeatSPSPPS = 1` resilience. AMD and Intel MFTs may behave differently here; verify when those probes run.
+
+### 4.6 VDD — virtual display lifecycle
 
 The user explicitly wants VDD to **only create a virtual monitor while a client is connected**, not always-on. When the Android client disconnects, the virtual monitor should disappear. Idle state = no virtual monitor (the cursor can't wander into dead pixel space).
 
-Technically possible because IDD natively supports `IddCxMonitorArrival` / `IddCxMonitorDeparture`. Practically: the chosen VDD fork's IPC must expose this. itsmikethetech VDD has it via a named-pipe protocol. **Pin to a specific commit** (do not pull `main` blindly) — the IPC has changed historically.
+The predecessor `main` branch proves manual install + stable capture through Virtual Driver Control, not runtime plug/unplug. Technically this should be possible because IDD supports `IddCxMonitorArrival` / `IddCxMonitorDeparture`, but Wave 5 must first identify and pin the exact VDD control path that exposes it. If the proven VirtualDrivers release has no supported runtime control mechanism, evaluate a fork or companion service. Do not pull an arbitrary VDD `main` blindly; the XML schema and control surface have changed historically.
 
 This is Wave 5 work, not Wave 2. Don't engineer it now; just don't accidentally lock yourself out.
 
@@ -347,22 +361,21 @@ This is Wave 5 work, not Wave 2. Don't engineer it now; just don't accidentally 
 
 ## 5. Forward plan
 
-### 5.1 Immediate next step (do this first)
+### 5.1 Wave-2 gates: status
 
-**Run the §3.3 IDR gate test before doing anything else in `penflow-core`.** It's a half-day of work that gates the entire encoder design. If MF can't do on-demand IDR, the design changes (periodic IDR + reset-on-reconnect instead).
+All three Wave-2 gates PASS on the dev rig (RTX 5070, NVIDIA-only desktop, 2026-05-03):
 
-Concrete shape: a small `examples/mf_idr_probe.rs` in `penflow-core` that:
-1. Creates a `D3d11Context`.
-2. Enumerates HEVC encoder MFTs via `MFTEnumEx`.
-3. Activates the first one.
-4. Configures with `MF_LOW_LATENCY`, NV12 input, HEVC output, fps=60, bitrate=50 Mbps, manual GOP control.
-5. Generates 30 black frames, submits, drains output.
-6. On frame 5: sets `CODECAPI_AVEncVideoForceKeyFrame = TRUE`.
-7. Captures the next output frame's first NAL byte. If `((nal_byte >> 1) & 0x3F)` is 19 (IDR_W_RADL) or 20 (IDR_N_LP), the gate passes.
+| Gate | Probe | Result | Carried-forward residue |
+|---|---|---|---|
+| 1. MF on-demand IDR | `cargo run -p penflow-core --example mf_idr_probe` | PASS on NVIDIA HEVC MFT | Re-run on AMD + Intel MFTs when those adapters are available. Five MF gotchas captured in §4.5 — they're load-bearing for `encoder/mf.rs`. |
+| 2. Adapter/VDD topology | `cargo run -p penflow-core --example adapter_topology` | PASS — single D3D11 device for capture + encode | Three findings in §4.4b — multi-format DDA list, NVIDIA per-engine adapter quirk, DPI awareness. Re-run when VDD is installed (Wave 5) to confirm the VDD output lands on the high-perf adapter. |
+| 3. WinRT `InputInjector` (unpackaged) | `cargo run -p penflow-core --example inject_probe` | PASS — no MSIX capability needed for unpackaged binary | Re-run inside the WiX/MSI release shape during Wave 5. If it fails there, switch to MSIX-with-restricted-capability, a small broker process, or virtual HID (see `design.md` §6.6). |
 
-Report back. **This is the only "research before building" step**; everything else is straightforward implementation against a clear spec.
+The encoder design (§6.4) is now locked. Engine implementation per §5.2 can proceed.
 
-### 5.2 Implementation order (after the IDR gate passes)
+The probe binaries stay in `crates/penflow-core/examples/` — they're regression-protected by the workspace `cargo build` and exist as the canonical reference for "did the underlying API path actually work last time we touched this".
+
+### 5.2 Implementation order (after the Wave-2 gates pass)
 
 Roughly map to [`design.md`](design.md) §6, with the highest-confidence pieces first so milestones land early:
 
@@ -378,7 +391,7 @@ Roughly map to [`design.md`](design.md) §6, with the highest-confidence pieces 
 10. **`crates/penflow-core/src/inject/coords.rs`** + **`binding.rs`** — Matrix3x2 transform + binding model from OTD. ~80 LOC.
 11. **`crates/penflow-core/src/lib.rs`** — public `Engine` API. Replace placeholder `build_id()`.
 12. **`crates/penflow-core/examples/capture_to_file.rs`** — verify with telemetry. Manual gate: `.h265` plays in VLC.
-13. **Apply the Android-side fixes from §1.3** to `android/app/src/main/java/dev/penflow/VideoDecoder.kt` (Adreno 620 fix is critical; codec recovery ladder is production-quality work).
+13. **Apply the Android-side fixes from §1.3** to `android/app/src/main/java/dev/penflow/VideoDecoder.kt` (Adreno 620 fix is critical; codec recovery ladder is production-quality work). For MIN_LATENCY frame pacing, keep async `MediaCodec.Callback`; do not call `dequeueOutputBuffer()` from inside callbacks. Use an async-safe latest-output-index strategy.
 
 After steps 1-13 land, `penflow-core` is functionally complete. Wave 3 (`penflow-server`) is then an afternoon: tokio session loop wiring the engine to the transport.
 
@@ -386,7 +399,7 @@ After steps 1-13 land, `penflow-core` is functionally complete. Wave 3 (`penflow
 
 - **Pressure curve** (configurable Bezier vs identity-with-threshold). Default is identity + threshold; revisit post-v1.0 based on user feedback.
 - **macOS pen injection target API**. WWDC offers `CGEvent` for mouse/pointing; pressure on macOS is historically thinner than Windows Ink. Investigate during the macOS wave.
-- **VDD fork pin**. Identify a specific itsmikethetech commit whose IPC exposes plug/unplug. May need to fork into `tools/vdd/` if upstream is unstable.
+- **VDD runtime-control pin**. Identify a specific VirtualDrivers release/fork/control mechanism that exposes plug/unplug. May need to fork into `tools/vdd/` or add a companion service if upstream is unstable.
 - **Crash reporting**. v1.0 has none. Local logs only. Sentry-style remote reporting is a Wave 6+ choice.
 
 ### 5.4 Acceptance gate for v1.0
@@ -433,7 +446,7 @@ When in doubt, the predecessor project at `C:\repo\krita\penflow\` is your refer
 
 The user prefers:
 - **Decisive defaults over endless options**. When research clearly favors one path, propose it as recommendation, not as a multiple-choice question.
-- **Action over planning**. "Auto mode" is the default; minimize gates. Stop and ask only when there's a real ambiguity (e.g., the §3.3 IDR gate decides which entire design branch to take).
+- **Action over planning**. "Auto mode" is the default; minimize gates. Stop and ask only when there's a real ambiguity (e.g., a Wave-2 gate changes the encoder, adapter/VDD, or input-injection branch).
 - **Honest cost accounting**. The user notices if you wave away tradeoffs. Don't say "small" — say "+30 MB DLL bundle" or "~+1 ms latency".
 - **Chinese-language feedback** is fine; technical terms stay English.
 - **Don't over-engineer for hypothetical needs**. Cross-platform abstractions exist *because the user explicitly asked for macOS support*, not for theoretical purity. Hybrid NVENC+MF was rejected for the same reason.
@@ -447,8 +460,8 @@ When committing: meaningful subject line, body explaining *why*, `Co-Authored-By
 ## 8. The TL;DR
 
 1. **Read [`design.md`](design.md)** end-to-end before touching code.
-2. **Run the §3.3 IDR gate test first**. It's the only "research before build" step.
-3. **Then implement `penflow-core` in §5.2's order**. Each step has a working reference in `C:\repo\krita\penflow\src\penflow_core\src\`.
+2. **Wave-2 gates are PASS on NVIDIA** (see §5.1 table). Re-run the three probes whenever you change the relevant code path; they're fast and self-checking.
+3. **Implement `penflow-core` in §5.2's order**. Each core hot-path step has a working reference in `C:\repo\krita\penflow\src\penflow_core\src\`, but remember that main used direct NVENC and Python `winsdk`, not MF and Rust packaging.
 4. **Apply §1.3 fixes to `android/`** at any point — the Adreno 620 crash is a real bug today.
 5. Don't reach for FFmpeg, GStreamer, bindgen, libclang, or NVENC SDK directly. The design rejected all five for documented reasons.
 6. Latency target: e2e ≤ 25 ms p50 on the RTX 5070 + MovinkPad rig. Predecessor hit 20 ms; this rewrite has slightly more conservative target to absorb MF overhead.
