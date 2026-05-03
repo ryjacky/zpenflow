@@ -1,40 +1,53 @@
 <?xml version='1.0' encoding='utf-8'?>
 <!--
-  Penflow VDD configuration — MINIMAL (compatible with VDD release 25.7.23).
+  Penflow VDD configuration — tuned for the MovinkPad Pro 14 (DTHA140).
 
-  Earlier versions of this file used the upstream master schema (HDR,
-  auto_resolutions, color_advanced sections). That binary version of mttvdd.dll
-  crashed parsing those sections (WUDFUnhandledException, c0000005). This
-  reduced version contains only the fields the 25.7.23 binary actually parses.
+  Single virtual monitor at the panel's exact native resolution, 2880×1800,
+  with 60 Hz + 120 Hz advertised so MediaCodec on the tablet can pick its
+  preferred timing without us having to retune. No other resolutions —
+  Penflow always streams at 2880×1800 to match the MovinkPad's physical
+  panel and Krita-on-extended-monitor only needs that one mode.
 
-  Result: a single virtual monitor at 2880×1800, advertising 60 Hz and 120 Hz.
+  Schema follows the format the currently-installed VDD binary
+  auto-generates after install — the older minimal schema (just
+  monitors/gpu/global/resolutions, no <options>) was for an earlier
+  release; the binary changed the format and the older version no
+  longer parses cleanly into "create a monitor". HANDOFF §2.1 used to
+  warn about an older crashy upstream schema (HDR/auto_resolutions);
+  that's also obsolete — what's below is what the 25.7+ binary
+  generates from a fresh install on this rig. Keep the <options>
+  block at conservative defaults (no SDR10/HDRPlus, hardware cursor on,
+  logging off).
 -->
 <vdd_settings>
-
     <monitors>
         <count>1</count>
     </monitors>
-
     <gpu>
         <friendlyname>default</friendlyname>
     </gpu>
-
     <global>
+        <!-- Global refresh rates — replicated to every <resolution> below
+             by the driver. The MovinkPad panel is 120 Hz; we offer 60
+             too in case the negotiation prefers it for some reason. -->
         <g_refresh_rate>60</g_refresh_rate>
         <g_refresh_rate>120</g_refresh_rate>
     </global>
-
     <resolutions>
-        <resolution>
-            <width>2880</width>
-            <height>1800</height>
-            <refresh_rate>60</refresh_rate>
-        </resolution>
         <resolution>
             <width>2880</width>
             <height>1800</height>
             <refresh_rate>120</refresh_rate>
         </resolution>
     </resolutions>
-
+    <options>
+        <CustomEdid>false</CustomEdid>
+        <PreventSpoof>false</PreventSpoof>
+        <EdidCeaOverride>false</EdidCeaOverride>
+        <HardwareCursor>true</HardwareCursor>
+        <SDR10bit>false</SDR10bit>
+        <HDRPlus>false</HDRPlus>
+        <logging>false</logging>
+        <debuglogging>false</debuglogging>
+    </options>
 </vdd_settings>
