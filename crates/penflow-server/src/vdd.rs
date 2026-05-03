@@ -52,18 +52,17 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
     SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, CM_DEVNODE_STATUS_FLAGS,
     CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CM_PROB_DISABLED, CONFIGRET, CR_ACCESS_DENIED,
-    CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_PRESENT, DN_HAS_PROBLEM, GUID_DEVCLASS_DISPLAY,
-    HDEVINFO, SETUP_DI_REGISTRY_PROPERTY, SP_DEVINFO_DATA, SPDRP_DEVICEDESC,
-    SPDRP_FRIENDLYNAME,
+    CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_PRESENT, DN_HAS_PROBLEM, GUID_DEVCLASS_DISPLAY, HDEVINFO,
+    SETUP_DI_REGISTRY_PROPERTY, SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SP_DEVINFO_DATA,
+};
+use windows::Win32::Devices::Display::{
+    SetDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_TOPOLOGY_EXTEND, SDC_VIRTUAL_MODE_AWARE,
+    SDC_VIRTUAL_REFRESH_RATE_AWARE,
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-use windows::Win32::Security::{
-    GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
-};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::Win32::UI::Shell::{
-    ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
-};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 use penflow_core::d3d11::create_dxgi_factory;
@@ -75,6 +74,12 @@ pub enum VddError {
     /// A Windows API call failed unexpectedly.
     #[error("Windows API: {0}")]
     Win32(#[from] windows::core::Error),
+
+    /// Windows accepted the PnP enable, but applying the desktop topology
+    /// failed. PnP enable only makes the IddCx target available; the target
+    /// still has to be attached to the desktop before DXGI can capture it.
+    #[error("DisplayConfig: {0}")]
+    DisplayConfig(String),
 
     /// `CM_Locate_DevNodeW` couldn't find the device. Either the
     /// instance id is wrong or the device was uninstalled.
@@ -148,10 +153,15 @@ pub enum VddError {
          Monitors seen during the wait: {monitors_seen:?}\n\
          Device status timeline: {status_timeline:?}\n\
          If the timeline shows the device stayed healthy (no DN_HAS_PROBLEM bit, problem=0)\n\
-         but no virtual monitor appeared, the driver process is running but isn't creating\n\
-         any monitor. Most common cause: C:\\VirtualDisplayDriver\\vdd_settings.xml is not\n\
-         the minimal schema the binary parses. Replace it with tools/vdd/vdd_settings.xml\n\
-         from this repo and click 'Reload Driver' in Virtual Driver Control."
+         but no virtual monitor appeared, check whether DisplayConfig topology extension\n\
+         succeeded. This VDD publishes a generic DXGI output name such as \\\\.\\DISPLAY27,\n\
+         so Penflow detects it as the new attached output that was not present before\n\
+         PnP enable. If no new output appears, check recent Application/System events for\n\
+         WUDFUnhandledException or UMDF crash events involving mttvdd.dll, then enable VDD\n\
+         logging and inspect C:\\VirtualDisplayDriver\\Logs for DeviceD0Entry/InitAdapter/\n\
+         MonitorArrival events.\n\
+         Do not use the VDD 25.7.23 RELOAD_DRIVER pipe command as automatic recovery; that\n\
+         driver path has been observed to crash mttvdd.dll on this setup."
     )]
     EnumerationTimeout {
         /// How long we waited before giving up.
@@ -220,7 +230,10 @@ impl VddController {
         // Verbose listing if PENFLOW_VDD_TRACE=1 — useful when detection
         // missed an obviously-installed device.
         if std::env::var_os("PENFLOW_VDD_TRACE").is_some() {
-            eprintln!("[vdd-trace] enumerated {} Display-class devices:", candidates.len());
+            eprintln!(
+                "[vdd-trace] enumerated {} Display-class devices:",
+                candidates.len()
+            );
             for c in &candidates {
                 eprintln!(
                     "[vdd-trace]   id={} disabled={} name={:?}",
@@ -236,8 +249,7 @@ impl VddController {
                 let canonical_no = !c
                     .friendly_name
                     .to_lowercase()
-                    .contains("virtual display driver")
-                    as u8;
+                    .contains("virtual display driver") as u8;
                 (status_ok, canonical_no)
             });
         Ok(chosen.map(|c| Self {
@@ -300,13 +312,37 @@ impl Drop for VddController {
 pub async fn wait_for_virtual_monitor(
     timeout: Duration,
     instance_id: Option<&str>,
+    baseline_attached_keys: Option<&[String]>,
 ) -> Result<MonitorInfo, VddError> {
     let start = Instant::now();
     let mut all_seen: Vec<String> = Vec::new();
     let mut status_timeline: Vec<String> = Vec::new();
     let mut last_dxgi_err: Option<String> = None;
     let mut last_status_t = Instant::now();
+    let mut last_topology_t: Option<Instant> = None;
     while Instant::now().duration_since(start) < timeout {
+        // PnP enable starts the IddCx device and publishes monitor targets.
+        // Windows still has to attach the newly-available target to the
+        // desktop topology. DisplaySwitch.exe /extend proved this is the
+        // missing step on the target machine; SetDisplayConfig is the native
+        // equivalent and avoids spawning another helper process.
+        if baseline_attached_keys.is_some()
+            && last_topology_t
+                .map(|t| t.elapsed() >= Duration::from_secs(1))
+                .unwrap_or(true)
+        {
+            let elapsed_ms = start.elapsed().as_millis();
+            match extend_desktop_to_available_displays() {
+                Ok(()) => status_timeline.push(format!(
+                    "+{elapsed_ms:>5}ms display topology: requested SDC_TOPOLOGY_EXTEND"
+                )),
+                Err(e) => status_timeline.push(format!(
+                    "+{elapsed_ms:>5}ms display topology: extend failed: {e}"
+                )),
+            }
+            last_topology_t = Some(Instant::now());
+        }
+
         // Sample DXGI.
         match create_dxgi_factory() {
             Ok(factory) => match monitors::enumerate(&factory) {
@@ -321,7 +357,15 @@ pub async fn wait_for_virtual_monitor(
                         }
                     }
                     if let Some(m) = mons.into_iter().find(|m| {
-                        m.looks_virtual && m.attached_to_desktop && !m.adapter_is_software
+                        if !m.attached_to_desktop || m.adapter_is_software {
+                            return false;
+                        }
+                        if m.looks_virtual {
+                            return true;
+                        }
+                        baseline_attached_keys
+                            .map(|keys| !keys.iter().any(|k| k == &monitor_key(m)))
+                            .unwrap_or(false)
                     }) {
                         return Ok(m);
                     }
@@ -356,6 +400,43 @@ pub async fn wait_for_virtual_monitor(
             monitors_seen: all_seen,
             status_timeline,
         })
+    }
+}
+
+/// Snapshot the outputs that are already attached before enabling VDD.
+/// The MTT VDD presents as a generic DXGI output name (`\\.\DISPLAY27`)
+/// on the physical GPU, so after topology extension the reliable signal is
+/// "new attached output", not "name contains VDD".
+pub fn snapshot_attached_monitor_keys() -> Result<Vec<String>, VddError> {
+    let factory =
+        create_dxgi_factory().map_err(|e| VddError::Dxgi(format!("create_dxgi_factory: {e:?}")))?;
+    let monitors =
+        monitors::enumerate(&factory).map_err(|e| VddError::Dxgi(format!("enumerate: {e:?}")))?;
+    Ok(monitors
+        .iter()
+        .filter(|m| m.attached_to_desktop && !m.adapter_is_software)
+        .map(monitor_key)
+        .collect())
+}
+
+fn monitor_key(m: &MonitorInfo) -> String {
+    format!("{}:{}", m.adapter_luid, m.device_name)
+}
+
+fn extend_desktop_to_available_displays() -> Result<(), VddError> {
+    let flags = SDC_APPLY
+        | SDC_TOPOLOGY_EXTEND
+        | SDC_ALLOW_CHANGES
+        | SDC_VIRTUAL_MODE_AWARE
+        | SDC_VIRTUAL_REFRESH_RATE_AWARE;
+    let code = unsafe { SetDisplayConfig(None, None, flags) };
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(VddError::DisplayConfig(format!(
+            "SetDisplayConfig(SDC_TOPOLOGY_EXTEND) returned {code}: {}",
+            std::io::Error::from_raw_os_error(code)
+        )))
     }
 }
 
@@ -694,17 +775,15 @@ fn problem_code_hint(problem: u32) -> String {
         21 => "CM_PROB_WILL_BE_REMOVED — device is being removed.".into(),
         24 => "CM_PROB_DISABLED_SERVICE — the driver service is disabled.".into(),
         28 => "CM_PROB_NEEDS_FORCED_CONFIG — driver wants a manual configuration.".into(),
-        31 => "CM_PROB_FAILED_POST_START — the user-mode driver host (mttvdd.dll) likely crashed during init. HANDOFF §2.1 documents this for VirtualDrivers/Virtual-Display-Driver: replace `C:\\VirtualDisplayDriver\\vdd_settings.xml` with the minimal `tools/vdd/vdd_settings.xml` we ship and Disable→Enable the device once.".into(),
-        43 => "CM_PROB_FAILED_INSTALL — the user-mode driver host failed to start. Same fix as code 31: replace vdd_settings.xml with the minimal one in tools/vdd/.".into(),
+        31 => "CM_PROB_FAILED_POST_START — the user-mode driver host (mttvdd.dll) likely crashed during init. Replace `C:\\VirtualDisplayDriver\\vdd_settings.xml` with a known-good 25.7.x schema, then Disable→Enable the device. Do not use the 25.7.23 RELOAD_DRIVER pipe command as recovery; it has been observed to crash this driver build.".into(),
+        43 => "CM_PROB_FAILED_INSTALL — the user-mode driver host failed to start. Same fix as code 31: replace vdd_settings.xml with a known-good 25.7.x schema, then Disable→Enable the device. Do not use RELOAD_DRIVER as recovery.".into(),
         _ => format!("(no hint for problem code {problem}; check Device Manager → device → Properties → General → Device status)"),
     }
 }
 
 fn is_process_elevated() -> bool {
     let mut token: HANDLE = HANDLE::default();
-    let opened = unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok()
-    };
+    let opened = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok() };
     if !opened {
         return false;
     }
@@ -728,9 +807,8 @@ fn is_process_elevated() -> bool {
 /// <instance_id>` arguments. Waits for the elevated child to exit and
 /// translates exit code into `Result`.
 fn run_helper_elevated(action: &str, instance_id: &str) -> Result<(), VddError> {
-    let exe = env::current_exe().map_err(|e| {
-        VddError::ShellExecute(format!("can't resolve current exe path: {e}"))
-    })?;
+    let exe = env::current_exe()
+        .map_err(|e| VddError::ShellExecute(format!("can't resolve current exe path: {e}")))?;
 
     // Helper invocation: `<exe> --vdd-helper <action> <instance_id>`.
     // Quote the instance id because it can contain backslashes (spaces
@@ -806,5 +884,25 @@ mod tests {
         // Don't assert the result — depends on test environment.
         let _ = is_process_elevated();
     }
-}
 
+    #[test]
+    fn monitor_key_uses_luid_and_device_name() {
+        let m = MonitorInfo {
+            adapter_index: 0,
+            adapter_luid: 42,
+            adapter_name: "adapter".into(),
+            adapter_vendor_id: 0,
+            adapter_device_id: 0,
+            adapter_is_software: false,
+            output_index_within_adapter: 0,
+            device_name: r"\\.\DISPLAY27".into(),
+            width: 2880,
+            height: 1800,
+            desktop_coords: (0, 0, 2880, 1800),
+            rotation: 1,
+            attached_to_desktop: true,
+            looks_virtual: false,
+        };
+        assert_eq!(monitor_key(&m), r"42:\\.\DISPLAY27");
+    }
+}

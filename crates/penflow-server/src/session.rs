@@ -40,7 +40,9 @@ use penflow_protocol::{
 };
 use penflow_transport::{Transport, TransportStream};
 
-use crate::vdd::{wait_for_virtual_monitor, VddController, VddError};
+use crate::vdd::{
+    snapshot_attached_monitor_keys, wait_for_virtual_monitor, VddController, VddError,
+};
 
 /// Session-level errors. Most fan-in from the engine, transport, or protocol;
 /// the variants below capture the few cases where the orchestrator wants to
@@ -228,17 +230,19 @@ impl Session {
                 vdd.friendly_name(),
                 vdd.instance_id()
             );
+            let baseline_attached = snapshot_attached_monitor_keys()?;
             vdd.enable()?;
             // Windows + the VDD driver itself can take a couple of seconds
             // to publish the new monitor through DXGI on a cold start (it
-            // re-reads vdd_settings.xml, calls IddCxMonitorArrival,
-            // SurfaceFlinger / DWM rebuilds the monitor list). 15 s is
-            // generous; if we hit this we genuinely have a configuration
+            // re-reads vdd_settings.xml, calls IddCxMonitorArrival, and
+            // DisplayConfig attaches the new target to the desktop). 15 s is
+            // generous; if we hit this we genuinely have a driver/topology
             // problem.
             let instance_id = vdd.instance_id().to_string();
             let virt = wait_for_virtual_monitor(
                 Duration::from_secs(15),
                 Some(&instance_id),
+                Some(&baseline_attached),
             )
             .await?;
             eprintln!(
@@ -391,6 +395,11 @@ impl Session {
             let _ = w.flush().await;
         }
         let _ = engine.stop();
+        // VddController's Drop runs Disable-PnpDevice via the elevated
+        // helper after this scope exits. Windows clears the extend
+        // topology automatically when the VDD output disappears, so
+        // we don't need to call SetDisplayConfig ourselves on the way
+        // out.
 
         if let Some(tx) = &events {
             match &read_result {

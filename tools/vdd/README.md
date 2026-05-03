@@ -12,18 +12,19 @@ The server enables the driver **only while an Android client is connected**:
 1. Operator launches `run_session` on the PC. PC desktop unchanged.
 2. Operator taps the Penflow app on the tablet.
 3. After the protocol handshake (`HELLO_ANDROID`), the server runs
-   `Enable-PnpDevice` → the virtual monitor pops up in Windows display
-   settings, the engine captures it, frames flow to the tablet.
+   an elevated Configuration Manager enable helper, then applies Windows
+   display topology extend (`SetDisplayConfig`) so the newly-available VDD
+   target is attached to the desktop. The engine captures that new output and
+   frames flow to the tablet.
 4. Operator closes the tablet app or hits Ctrl-C on the PC. Server runs
-   `Disable-PnpDevice` → the virtual monitor disappears.
+   the elevated disable helper → the virtual monitor disappears.
 
 This avoids cluttering the desktop arrangement when nothing is connected and
 prevents the cursor from wandering into "dead pixel space".
 
-**Admin required.** `Enable-PnpDevice` / `Disable-PnpDevice` are gated on
-Administrator. Run `cargo run -p penflow-server --example run_session` from
-an elevated PowerShell. If you forget, the server exits with a clear
-`Access is denied` / `要求提升` message.
+**Admin approval required.** Device enable/disable is gated on Administrator.
+The server launches a small UAC helper only when it needs to flip the VDD
+devnode, so a normal PowerShell is fine as long as you approve the UAC prompts.
 
 If you don't want VDD (mirror the primary monitor instead), pass
 `--no-vdd` and the server skips detection entirely.
@@ -57,9 +58,14 @@ for **install only** — runtime enable/disable is then driven by the server.
    ```
    (If `C:\VirtualDisplayDriver\` doesn't exist, the driver creates it during
    install. If the copy says "Access denied", run the PowerShell as Admin.)
-6. Back in Virtual Driver Control, click **Reload Driver** so it re-reads the XML.
+6. Back in Virtual Driver Control, use **Disable**, then **Enable**, so the
+   driver re-reads the XML through the normal PnP D0Entry path.
 7. **Then click Disable** (or wait for it to be in Disabled / Error state in
    Device Manager). The server will enable it when needed.
+
+Avoid VDC's **Reload Driver** action on 25.7.23 while debugging Penflow. On
+this rig it produced `WUDFUnhandledException` crashes in `mttvdd.dll`; the
+safe reset path is Disable→Enable.
 
 ## Verifying it worked
 
@@ -92,9 +98,17 @@ cargo run -p penflow-server --example run_session
 # Skip VDD entirely; capture the physical monitor instead:
 cargo run -p penflow-server --example run_session -- --no-vdd
 
+# Probe only: enable VDD, attach display topology, wait for DXGI, then disable:
+cargo run -p penflow-server --example run_session -- --vdd-probe
+
 # Pick a specific physical monitor (when --no-vdd):
 cargo run -p penflow-server --example run_session -- --no-vdd --monitor 1
 ```
+
+If the 25.7.23 driver cannot survive on-demand enable/disable on this machine,
+leave VDD enabled manually and run with `--no-vdd --monitor <index>` where the
+listed monitor is the virtual display. In that mode Penflow captures the
+already-present virtual monitor and does not touch the VDD devnode.
 
 ## Troubleshooting
 
@@ -108,10 +122,12 @@ cargo run -p penflow-server --example run_session -- --no-vdd --monitor 1
 - **Server logs `Enable-PnpDevice failed ... Access is denied`**: the
   PowerShell that launched `run_session` isn't elevated. Re-launch it as
   Administrator.
-- **Server enables VDD but logs `EnumerationTimeout`**: Windows took too
-  long to publish the new monitor through DXGI. Try Disable→Enable cycle
-  in Virtual Driver Control once to reset state. If it persists, the
-  driver's XML may be malformed (see the next item).
+- **Server enables VDD but logs `EnumerationTimeout`**: run `--vdd-probe`.
+  Penflow should report a newly-attached generic DXGI output such as
+  `\\.\DISPLAY28 ... on NVIDIA GeForce RTX 5070`. If the Display class device
+  and Monitor child are OK but DXGI still has no new output, the Windows
+  topology extend failed; try a Disable→Enable cycle in Virtual Driver Control
+  and do not use Reload Driver on 25.7.23.
 - **Driver crashes on Enable, monitor PnP shows `Unknown`**: the
   user-mode driver host (`mttvdd.dll`) is throwing an unhandled exception
   while parsing the XML. The upstream `master`-branch `vdd_settings.xml`
@@ -124,8 +140,10 @@ cargo run -p penflow-server --example run_session -- --no-vdd --monitor 1
       Where-Object { $_.Message -match 'mttvdd' } | Select-Object TimeCreated, LevelDisplayName
   ```
   If you see `WUDFUnhandledException` entries with `mttvdd.dll`, that's the
-  symptom. Fix: replace `C:\VirtualDisplayDriver\vdd_settings.xml` with the
-  minimal one in this directory, then Disable/Enable the driver once.
+  symptom. Fix: replace `C:\VirtualDisplayDriver\vdd_settings.xml` with a
+  known-good 25.7.x schema, then Disable/Enable the driver once. Avoid
+  `RELOAD_DRIVER` while testing because it can crash this release on this
+  machine.
 - **Two virtual monitors appear in Device Manager (e.g. MuMu's emulator
   adapter alongside ours)**: the server's auto-detect prefers the
   currently-disabled VDD that matches the canonical `Virtual Display

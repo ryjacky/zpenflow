@@ -56,6 +56,9 @@ fn main() -> ExitCode {
 
 async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
+    if args.vdd_probe {
+        return vdd_probe_main().await;
+    }
 
     // Probe for a Virtual Display Driver. If it's installed (regardless of
     // current enabled/disabled state), we'll enable it on connect and
@@ -215,6 +218,43 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+async fn vdd_probe_main() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(mut vdd) = VddController::detect()? else {
+        return Err("no Virtual Display Driver detected".into());
+    };
+    println!(
+        "[vdd-probe] detected: '{}' ({})",
+        vdd.friendly_name(),
+        vdd.instance_id()
+    );
+    let baseline = vdd::snapshot_attached_monitor_keys()?;
+    println!(
+        "[vdd-probe] baseline attached outputs: {}",
+        baseline.len()
+    );
+
+    let instance_id = vdd.instance_id().to_string();
+    println!("[vdd-probe] enabling VDD; approve the UAC prompt");
+    vdd.enable()?;
+
+    println!("[vdd-probe] waiting for a new attached DXGI output");
+    let result =
+        vdd::wait_for_virtual_monitor(Duration::from_secs(15), Some(&instance_id), Some(&baseline))
+            .await;
+
+    println!("[vdd-probe] disabling VDD cleanup; approve the UAC prompt");
+    if let Err(e) = vdd.disable() {
+        eprintln!("[vdd-probe] cleanup disable failed: {e}");
+    }
+
+    let virt = result?;
+    println!(
+        "[vdd-probe] virtual monitor appeared: {} {}x{} on {}",
+        virt.device_name, virt.width, virt.height, virt.adapter_name
+    );
+    Ok(())
+}
+
 struct Args {
     monitor_index: usize,
     bitrate_bps: u32,
@@ -224,6 +264,9 @@ struct Args {
     /// requires admin) or when the operator deliberately wants to mirror
     /// the existing desktop.
     no_vdd: bool,
+    /// `--vdd-probe`: enable VDD, attach display topology, wait for DXGI,
+    /// then disable it again. Does not start ADB or wait for Android.
+    vdd_probe: bool,
 }
 
 fn parse_args() -> Args {
@@ -232,6 +275,7 @@ fn parse_args() -> Args {
         bitrate_bps: 50_000_000,
         fps: 60,
         no_vdd: false,
+        vdd_probe: false,
     };
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -257,6 +301,9 @@ fn parse_args() -> Args {
             }
             "--no-vdd" => {
                 a.no_vdd = true;
+            }
+            "--vdd-probe" => {
+                a.vdd_probe = true;
             }
             other => {
                 eprintln!("[run_session] ignoring unknown arg: {other}");
