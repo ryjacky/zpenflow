@@ -167,18 +167,53 @@ impl Session {
     ) -> Result<(), SessionError> {
         let session_start = Instant::now();
 
-        // 1. Engine: bring up capture+encode and request an immediate IDR so
-        //    we get csd-0 in the first packet.
+        // 1. Accept the transport FIRST. Engine startup happens after the
+        //    handshake — otherwise the pipeline runs while we wait for
+        //    Android, the queue (capacity 8, drop-oldest) silently evicts
+        //    the encoder's natural first-frame IDR, and `wait_for_keyframe`
+        //    times out waiting for the next IDR (10s away at GOP=600).
+        let stream = transport.accept().await?;
+        let TransportStream {
+            mut reader,
+            mut writer,
+            peer_label,
+        } = stream;
+
+        if let Some(tx) = &events {
+            let _ = tx
+                .send(SessionEvent::Connecting { peer: peer_label.clone() })
+                .await;
+        }
+
+        // 2. Handshake: read HELLO_ANDROID.
+        let (msg_id, payload) = read_frame(&mut reader).await?;
+        if msg_id != MSG_HELLO_ANDROID {
+            return Err(SessionError::UnexpectedHandshakeMessage(msg_id));
+        }
+        let android = HelloAndroid::decode(&payload)?;
+        eprintln!(
+            "[session] HELLO_ANDROID from {}: {}x{} pen_max_pressure={} caps=0b{:08b}",
+            peer_label,
+            android.display_width,
+            android.display_height,
+            android.pen_max_pressure,
+            android.codec_caps
+        );
+
+        // 3. NOW start the engine. HEVC's first encoded frame is necessarily
+        //    an IDR (no reference frames available), so we don't need an
+        //    explicit `request_idr()` — just take whatever comes off the
+        //    queue first.
         let engine = Engine::builder(self.cfg.monitor.clone())
             .codec(self.cfg.codec)
             .bitrate_bps(self.cfg.bitrate_bps)
             .fps(self.cfg.fps)
             .start()?;
-        engine.request_idr();
 
-        // 2. Build the input injectors from the captured monitor's coords.
-        //    PenInjector::new sets PER_MONITOR_AWARE_V2 process-wide so
-        //    captured coords + injection coords are both physical pixels.
+        // 4. Build the input injectors and the input→output coordinate
+        //    transform. PenInjector::new sets PER_MONITOR_AWARE_V2 process-
+        //    wide so captured coords + injection coords are both physical
+        //    pixels (gate-2 §4.4b).
         let pen = Arc::new(Mutex::new(PenInjector::new()?));
         let touch = Arc::new(Mutex::new(TouchInjector::new(
             self.cfg.max_touch_contacts,
@@ -199,36 +234,12 @@ impl Session {
             rotation_deg,
         );
 
-        // 3. Accept the transport.
-        let stream = transport.accept().await?;
-        let TransportStream {
-            mut reader,
-            mut writer,
-            peer_label,
-        } = stream;
-
-        if let Some(tx) = &events {
-            let _ = tx.send(SessionEvent::Connecting { peer: peer_label.clone() }).await;
-        }
-
-        // 4. Handshake: read HELLO_ANDROID.
-        let (msg_id, payload) = read_frame(&mut reader).await?;
-        if msg_id != MSG_HELLO_ANDROID {
-            return Err(SessionError::UnexpectedHandshakeMessage(msg_id));
-        }
-        let android = HelloAndroid::decode(&payload)?;
-        eprintln!(
-            "[session] HELLO_ANDROID from {}: {}x{} pen_max_pressure={} caps=0b{:08b}",
-            peer_label,
-            android.display_width,
-            android.display_height,
-            android.pen_max_pressure,
-            android.codec_caps
-        );
-
-        // 5. Wait for the first keyframe so we can derive csd-0.
+        // 5. Wait for the first keyframe so we can derive csd-0. The engine
+        //    just started; first packet is the IDR. 5 s timeout absorbs DDA
+        //    cold-start (Sunshine reports first AcquireNextFrame can take
+        //    400-800 ms on hot reconfig).
         let queue = engine.packet_queue();
-        let first_pkt = wait_for_keyframe(&queue, Duration::from_secs(3)).await?;
+        let first_pkt = wait_for_keyframe(&queue, Duration::from_secs(5)).await?;
         let csd0 = extract_hevc_nals(&first_pkt.bytes, &[32, 33, 34]);
         if csd0.is_empty() {
             // Defensive: a keyframe with no parameter sets is a violation
