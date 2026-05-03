@@ -91,6 +91,15 @@ pub struct MfSession {
     _dev_mgr: IMFDXGIDeviceManager,
     /// Filled with VPS+SPS+PPS bytes when we observe the first IDR.
     sequence_header: Vec<u8>,
+    /// Cached `METransformNeedInput` credit. We pre-fetch the next credit
+    /// at the END of `submit_frame` (post-`ProcessInput`) so the same
+    /// blocking `GetEvent` call also drains *this* frame's HaveOutput
+    /// promptly. Without this, `wait_for_need_input` only ran at the
+    /// START of the next submit — meaning a frame's HaveOutput sat in
+    /// the MFT event queue for a full pipeline tick (~8 ms), inflating
+    /// `encode_us` and delaying the wire send by the same amount.
+    /// True iff a credit is available without another GetEvent call.
+    have_need_input_credit: bool,
     /// Internal output queue — packets we drained from `METransformHaveOutput`
     /// events but the caller hasn't claimed yet.
     output_queue: VecDeque<EncodedPacket>,
@@ -177,6 +186,7 @@ impl MfSession {
             sequence_header: Vec::new(),
             output_queue: VecDeque::new(),
             pending_input_meta: VecDeque::new(),
+            have_need_input_credit: false,
         })
     }
 
@@ -312,11 +322,14 @@ impl EncodeSession for MfSession {
         pts_ns: i64,
         force_idr: bool,
     ) -> EngineResult<()> {
-        // 1. Block until the MFT signals NeedInput (queueing any HaveOutput
-        //    events along the way). Bounded by the encoder's frame budget
-        //    (~1ms on NVIDIA HEVC at 60fps); the pipeline thread is single-
-        //    threaded so blocking here is fine.
-        self.wait_for_need_input()?;
+        // 1. Acquire a NeedInput credit. Usually pre-fetched by the
+        //    previous submit's post-drain step, in which case we're free
+        //    to ProcessInput immediately. On the very first call (or
+        //    after a hot restart) we have to block.
+        if !self.have_need_input_credit {
+            self.wait_for_need_input()?;
+        }
+        self.have_need_input_credit = false;
 
         // 2. Force IDR before ProcessInput if requested. Failure is
         //    non-fatal — design §6.4.1 fallback handles backends that
@@ -350,12 +363,23 @@ impl EncodeSession for MfSession {
         unsafe { self.transform.ProcessInput(STREAM_ID, &sample, 0)? };
         // Anchor *after* ProcessInput returns so encode_us measures only
         // the encoder's wall-clock work, not the caller's pre-submit
-        // texture wrap / SetSampleTime overhead. `force_idr` isn't
-        // tracked on the meta record because we don't surface it
-        // anywhere downstream.
-        let _ = force_idr;
+        // texture wrap / SetSampleTime overhead.
         self.pending_input_meta
             .push_back((pts_ns, Instant::now()));
+
+        // 4. Pre-fetch the next NeedInput credit. NVENC P1 ULL with
+        //    `MF_LOW_LATENCY=1` has a shallow pipeline that emits
+        //    HaveOutput for THIS frame BEFORE signalling readiness for
+        //    the next input — so this blocking GetEvent loop drains the
+        //    just-submitted frame's output along the way and stamps
+        //    `encode_us` accurately at the actual MFT-emit moment. If
+        //    we deferred this drain to the next pipeline tick (which
+        //    might be 8 ms away when DDA is timing out on a static
+        //    desktop), encode_us and the wire-send latency would both
+        //    inflate by that gap.
+        self.wait_for_need_input()?;
+        self.have_need_input_credit = true;
+
         Ok(())
     }
 
