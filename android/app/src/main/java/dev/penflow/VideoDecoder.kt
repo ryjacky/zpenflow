@@ -1,7 +1,6 @@
 package dev.penflow
 
 import android.media.MediaCodec
-import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
@@ -97,7 +96,15 @@ class VideoDecoder(
             setByteBuffer("csd-0", ByteBuffer.wrap(csd0))
             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            // DELIBERATELY NOT setting KEY_COLOR_FORMAT: when configure() is
+            // called with a Surface (our case — direct rendering, no
+            // CPU-side ByteBuffer output), the framework picks the right
+            // surface-compatible color format itself. Manually specifying
+            // COLOR_FormatSurface here makes c2.qti.hevc.decoder (and
+            // probably others) reject the configuration with
+            // "configureIntf failed" / "? is not a supported pixel format!"
+            // and fall back to a path that doesn't actually drive the
+            // SurfaceView. Lesson: surface configure is implicit.
 
             if (isQualcomm) {
                 // Adreno 620 fix: do NOT set KEY_PRIORITY=0 alongside
