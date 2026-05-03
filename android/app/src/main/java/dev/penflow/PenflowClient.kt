@@ -177,12 +177,22 @@ class PenflowClient(
                 Protocol.MSG_VIDEO_FRAME -> {
                     val recvNs = System.nanoTime()
                     val header = Protocol.decodeVideoFrame(payload)
-                    dec.feed(header.coded)
+                    // Offer the HUD sample BEFORE feeding the decoder.
+                    // MediaCodec is async — when frames are tiny (idle
+                    // desktop = static keepalive ~50 B) the codec
+                    // sometimes fires `onOutputBufferAvailable` between
+                    // `feed()` returning and the offer landing. The
+                    // poll then sees an empty queue, drops this frame's
+                    // recv timestamp, and the next decode callback ends
+                    // up paired with the previous frame's recv — turning
+                    // `decode_us` into "inter-frame interval + decode"
+                    // (~200 ms when idle at 5 fps from DDA timeout).
                     if (hud != null) {
                         pendingFrameSamples.offer(
                             PendingSample(header.ptsNs, header.captureUs, header.encodeUs, recvNs)
                         )
                     }
+                    dec.feed(header.coded)
                 }
                 Protocol.MSG_TELEMETRY -> {
                     hud?.recordServerTelemetry(Protocol.decodeTelemetry(payload))
