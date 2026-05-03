@@ -1,0 +1,95 @@
+//! Video encoder abstraction.
+//!
+//! Sunshine-inspired two-level shape (design.md §6.3): an `EncoderBackend`
+//! enumerates and instantiates `EncodeSession`s, then the session does the
+//! per-frame work. v1.0 ships one backend (`mf` for Windows Media Foundation
+//! HEVC). The macOS `videotoolbox` backend will plug in here post-v1.0
+//! without changing the trait surface.
+
+#[cfg(windows)]
+pub mod mf;
+
+use std::time::Instant;
+
+use crate::error::EngineResult;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Codec {
+    Hevc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PixelFormat {
+    /// 4:2:0 semi-planar; the canonical hardware-encoder input on Windows.
+    Nv12,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SessionConfig {
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bitrate_bps: u32,
+    pub codec: Codec,
+    pub input_format: PixelFormat,
+}
+
+/// One encoded packet as it leaves the encoder. Bytes are Annex-B (the MF
+/// HEVC encoder emits with start codes) and the parameter sets (VPS/SPS/PPS)
+/// are repeated on every IDR (HANDOFF §4.5 finding #5).
+pub struct EncodedPacket {
+    pub bytes: Vec<u8>,
+    /// Caller-supplied PTS in nanoseconds (we forward the value passed to
+    /// `submit_frame`). The MF encoder doesn't reorder, so packet PTS == input
+    /// frame PTS.
+    pub pts_ns: i64,
+    pub is_keyframe: bool,
+    /// `Instant` when the corresponding capture happened. Forwarded from
+    /// `submit_frame`'s caller for end-to-end telemetry.
+    pub captured_at: Option<Instant>,
+}
+
+#[cfg(windows)]
+pub trait EncoderBackend: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn supported_codecs(&self) -> &[Codec];
+    fn supported_input_formats(&self) -> &[PixelFormat];
+    /// Live-probe + instantiate a session. The backend is responsible for
+    /// rejecting MFTs that don't bind to `ctx.device` (gate-1 finding —
+    /// vendor MFTs are registered system-wide and the wrong one fails with
+    /// `E_OUTOFMEMORY` at SET_D3D_MANAGER).
+    fn make_session(
+        &self,
+        ctx: &crate::d3d11::D3d11Context,
+        cfg: SessionConfig,
+    ) -> EngineResult<Box<dyn EncodeSession>>;
+}
+
+#[cfg(windows)]
+pub trait EncodeSession: Send {
+    fn input_format(&self) -> PixelFormat;
+
+    /// Submit one input frame. MF hardware MFTs are async — internally this
+    /// drains pending output events first, then waits for `METransformNeedInput`,
+    /// then `ProcessInput`. `force_idr` requests an IDR via
+    /// `CODECAPI_AVEncVideoForceKeyFrame` (gate-1 verified to work on NVIDIA;
+    /// the call is a no-op on backends that don't support it, which would
+    /// fall back to periodic IDR per design §6.4.1).
+    ///
+    /// `tex` is captured by reference inside an `IMFSample` (zero-copy via
+    /// `MFCreateDXGISurfaceBuffer`); the caller MUST pass the SAME stable
+    /// texture every call (typically `ColorConverter::output_texture()`) so
+    /// MF can keep its driver-side resource cache warm.
+    fn submit_frame(
+        &mut self,
+        tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+        pts_ns: i64,
+        captured_at: Option<Instant>,
+        force_idr: bool,
+    ) -> EngineResult<()>;
+
+    /// Pop the next encoded packet, if one is ready. Non-blocking — drains
+    /// any pending `METransformHaveOutput` events first and then returns the
+    /// front of the internal queue.
+    fn try_packet(&mut self) -> EngineResult<Option<EncodedPacket>>;
+}

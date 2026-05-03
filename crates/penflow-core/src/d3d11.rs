@@ -28,6 +28,11 @@ pub fn create_dxgi_factory() -> EngineResult<IDXGIFactory6> {
     Ok(factory)
 }
 
+// SAFETY: D3D11 device with SetMultithreadProtected(true) is callable from any
+// thread as long as access is serialised; we move the context to the pipeline
+// thread and never share &D3d11Context across threads concurrently.
+unsafe impl Send for D3d11Context {}
+
 /// Owns the D3D11 device and the DXGI adapter it was created on. Holding the
 /// adapter alongside the device lets the rest of the engine verify "this
 /// output belongs to my device's adapter" by LUID equality.

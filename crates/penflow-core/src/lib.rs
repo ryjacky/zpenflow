@@ -11,6 +11,14 @@ pub mod d3d11;
 pub mod monitors;
 #[cfg(windows)]
 pub mod capture;
+#[cfg(windows)]
+pub mod color;
+#[cfg(windows)]
+pub mod encoder;
+
+pub mod packet_queue;
+#[cfg(windows)]
+pub mod pipeline;
 
 pub use error::{EngineError, EngineResult};
 

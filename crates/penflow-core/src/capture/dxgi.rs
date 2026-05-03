@@ -33,6 +33,12 @@ use crate::d3d11::D3d11Context;
 use crate::error::{EngineError, EngineResult};
 use crate::monitors::MonitorInfo;
 
+// SAFETY: All COM objects inside live on a single thread (the pipeline
+// capture thread). DDA + D3D11 device with SetMultithreadProtected serialise
+// access. Send is the move from the main thread that constructed the
+// capturer to the pipeline thread; never &-shared across threads.
+unsafe impl Send for DxgiCapturer {}
+
 /// Holds an `IDXGIOutputDuplication` against a specific output, with
 /// transparent recovery from `DXGI_ERROR_ACCESS_LOST` /
 /// `DXGI_ERROR_ACCESS_DENIED`.
