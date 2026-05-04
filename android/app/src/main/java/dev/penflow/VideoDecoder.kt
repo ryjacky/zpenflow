@@ -1,8 +1,6 @@
 package dev.penflow
 
 import android.media.MediaCodec
-import android.media.MediaCodecInfo
-import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
@@ -82,14 +80,26 @@ class VideoDecoder(
 ) {
 
     private val mime: String = mimeFor(codecId)
-    // Prefer a `.low_latency`-suffixed codec when one exists for this mime,
-    // OR a codec that advertises `FEATURE_LowLatency` (Android 11+ API). On
-    // Snapdragon 8s Gen 3 + Adreno 720 the device exposes BOTH
-    // `c2.qti.avc.decoder` and `c2.qti.avc.decoder.low_latency`, but
-    // `MediaCodec.createDecoderByType("video/avc")` defaults to the
-    // standard variant — we have to pick the low-latency one explicitly
-    // by name. Falls back to the default decoder on devices without one.
-    private val codec: MediaCodec = createLowLatencyDecoder(mime)
+    // Use `MediaCodec.createDecoderByType` (platform default).
+    //
+    // We previously preferred the `.low_latency`-suffixed variant via
+    // `createLowLatencyDecoder`, but that turned out to *increase*
+    // per-frame decode latency on Snapdragon 8s Gen 3: the standard
+    // c2.qti.{avc,hevc}.decoder reports `output_delay = 4` (small
+    // internal pipeline), while the `.low_latency` variant reports
+    // `output_delay = 24` regardless of the SPS we feed it (the
+    // `.low_latency` variant trades a deeper output pipeline for
+    // lower jitter — wrong trade for our zero-reorder, low-frame-
+    // rate-variation workload). The combination of the encoder-side
+    // SPS patcher (1-deep DPB declared in the bitstream) plus the
+    // standard decoder gives the smallest measured per-frame
+    // latency.
+    //
+    // `KEY_LOW_LATENCY = 1` plus the existing
+    // `vendor.qti-ext-dec-low-latency.enable` vendor key still tell
+    // the standard decoder to skip whatever output reordering it
+    // would otherwise do.
+    private val codec: MediaCodec = MediaCodec.createDecoderByType(mime)
 
     /** Owning codec callbacks; same handler is reused for posted render releases. */
     private val codecThread = HandlerThread("video-codec").apply { start() }
@@ -293,50 +303,5 @@ class VideoDecoder(
             return hw == "lito"
         }
 
-        /**
-         * Find the best decoder for [mime], preferring (in order):
-         *   1. A decoder whose name ends in `.low_latency`
-         *      (Qualcomm c2.qti convention — verified on Snapdragon 8s
-         *      Gen 3 / Adreno 720 to expose `c2.qti.avc.decoder.low_latency`
-         *      as a separate component from the standard
-         *      `c2.qti.avc.decoder`).
-         *   2. A decoder advertising `FEATURE_LowLatency` (API 30+
-         *      portable hint that vendors set on their LL pipelines).
-         *   3. The default decoder for [mime] (fallback).
-         *
-         * `MediaCodec.createDecoderByType` defaults to whatever the
-         * platform's CodecList enumerates first, which on Qualcomm is
-         * the *standard* variant — picking the LL one explicitly is the
-         * difference between dec_us steady at ~7-9 ms vs the standard
-         * variant ratcheting to 30-100 ms under content change.
-         */
-        private fun createLowLatencyDecoder(mime: String): MediaCodec {
-            val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-            val infos = list.codecInfos
-            // Pass 1 — explicit `.low_latency` name suffix.
-            for (info in infos) {
-                if (info.isEncoder) continue
-                if (!info.supportedTypes.any { it.equals(mime, ignoreCase = true) }) continue
-                if (info.name.endsWith(".low_latency", ignoreCase = true)) {
-                    Log.i(TAG, "selected low-latency decoder by name: ${info.name}")
-                    return MediaCodec.createByCodecName(info.name)
-                }
-            }
-            // Pass 2 — FEATURE_LowLatency (API 30+).
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                for (info in infos) {
-                    if (info.isEncoder) continue
-                    val caps = runCatching { info.getCapabilitiesForType(mime) }.getOrNull() ?: continue
-                    if (caps.isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)) {
-                        Log.i(TAG, "selected low-latency decoder by FEATURE_LowLatency: ${info.name}")
-                        return MediaCodec.createByCodecName(info.name)
-                    }
-                }
-            }
-            // Fallback — platform default.
-            val def = MediaCodec.createDecoderByType(mime)
-            Log.i(TAG, "no low-latency decoder for $mime; using platform default: ${def.name}")
-            return def
-        }
     }
 }
