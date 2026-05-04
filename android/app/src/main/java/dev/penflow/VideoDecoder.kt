@@ -10,6 +10,10 @@ import android.view.Surface
 import java.nio.ByteBuffer
 import java.util.ArrayDeque
 
+// API level constants for Surface.setFrameRate (declared inline so the file
+// builds on min-SDK without a separate compatibility shim).
+private const val FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1
+
 /**
  * Async hardware decoder rendering directly into a Surface.
  *
@@ -27,12 +31,20 @@ import java.util.ArrayDeque
  *   detect the affected chip via `Build.HARDWARE` and fall back to
  *   moonlight's Short.MAX_VALUE workaround on those devices only.
  *
- * Design.md §10.6 MIN_LATENCY frame pacing:
- *   Replaces unconditional `releaseOutputBuffer(idx, true)` with a
- *   newest-buffer-wins drain that posts the render release on the codec
- *   handler with `System.nanoTime()` as the PTS. Coalesces callback
- *   bursts to the latest output index, releases older ones with
- *   render=false, lets SurfaceFlinger drop superseded buffers under load.
+ * Render strategy: simple `releaseOutputBuffer(idx, true)` per callback,
+ * paired with a `Surface.setFrameRate(fps, FIXED_SOURCE)` hint to keep
+ * the panel's VRR controller from downclocking during idle periods.
+ *   We previously implemented design.md §10.6 MIN_LATENCY drain
+ *   (newest-wins, drop the rest, post render at System.nanoTime()) but
+ *   it caused a "ratchet" decoder degradation on the MovinkPad: dropping
+ *   most buffers made SurfaceFlinger see few presented frames, the panel
+ *   dropped to a low refresh rate, BufferQueue back-pressured the
+ *   remaining renders, the codec callback handler stalled inside
+ *   `releaseOutputBuffer`, and `decodedNs` (captured at callback entry)
+ *   ratcheted up to 30-40 ms when idle with no recovery until user touch
+ *   re-woke the panel. The simple form matches predecessor's measured
+ *   7-8 ms baseline and the setFrameRate hint stops the panel from idling
+ *   in the first place.
  *
  * Vendor key `vendor.qti-ext-dec-picture-order.enable=1`:
  *   Disables HEVC reorder buffering on Qualcomm. Saves 5-10 ms of decode
@@ -68,11 +80,6 @@ class VideoDecoder(
     private val lock = Any()
     private val pendingData = ArrayDeque<ByteArray>()
     private val parkedIndices = ArrayDeque<Int>()
-
-    // OUTPUT-side MIN_LATENCY state — drains to newest output index, drops the rest.
-    private val outputLock = Any()
-    private var newestOutputIndex: Int? = null
-    private var renderPosted = false
 
     fun start() {
         // codec.name reflects the actual decoder we got from
@@ -131,40 +138,28 @@ class VideoDecoder(
                 info: MediaCodec.BufferInfo
             ) {
                 val decodedNs = System.nanoTime()
-
-                // §10.6 MIN_LATENCY drain: keep only the newest index, release
-                // any older one with render=false. Post the render release on
-                // the codec handler so SurfaceFlinger can supersede it if a
-                // newer buffer arrives in the same vsync window.
-                var shouldPostRender = false
-                val dropped: Int? = synchronized(outputLock) {
-                    val d = newestOutputIndex
-                    newestOutputIndex = index
-                    if (!renderPosted) {
-                        renderPosted = true
-                        shouldPostRender = true
-                    }
-                    d
-                }
-                dropped?.let { c.releaseOutputBuffer(it, false) }
-
-                if (shouldPostRender) {
-                    codecHandler.post {
-                        val toRender: Int? = synchronized(outputLock) {
-                            val chosen = newestOutputIndex
-                            newestOutputIndex = null
-                            renderPosted = false
-                            chosen
-                        }
-                        toRender?.let { idx ->
-                            // Pass System.nanoTime() as the render PTS so
-                            // SurfaceFlinger schedules for the next vsync
-                            // and drops late buffers if superseded.
-                            c.releaseOutputBuffer(idx, System.nanoTime())
-                        }
-                    }
-                }
-
+                // Render every output buffer immediately at the next vsync.
+                //
+                // Earlier we used a §10.6 MIN_LATENCY drain (newest-buffer-
+                // wins, drop the rest, render task posted on the codec
+                // handler with `System.nanoTime()` as the PTS). In practice
+                // it produced a "ratchet" decoder degradation when idle:
+                // most outputs were released with render=false, the panel's
+                // VRR controller saw few presented frames and dropped to a
+                // low refresh rate, the BufferQueue then back-pressured the
+                // remaining renders, and `releaseOutputBuffer(idx, ts)` ate
+                // codec-handler time waiting for a slot. Since callbacks
+                // share the same handler, `decodedNs` (captured at callback
+                // entry) lagged by the queueing delay — pushing dec_us to
+                // 30-40 ms with no path back down until the user touched
+                // the screen and the panel jumped to 120 Hz again.
+                //
+                // The predecessor's simple `releaseOutputBuffer(idx, true)`
+                // measured 7-8 ms steady, with the bonus that SurfaceFlinger
+                // sees a continuous frame stream and keeps the panel awake
+                // at the requested rate (paired with the
+                // `Surface.setFrameRate` hint below).
+                c.releaseOutputBuffer(index, true)
                 onDecoded(decodedNs)
             }
 
@@ -184,6 +179,24 @@ class VideoDecoder(
 
         codec.configure(format, surface, null, 0)
         codec.start()
+
+        // Tell SurfaceFlinger our intended source frame rate. Without this
+        // hint MovinkPad's VRR / Adaptive Refresh Rate controller can drop
+        // the panel to a low rate when the rest of the system looks idle —
+        // which then back-pressures our render path (the BufferQueue fills
+        // because consumer is slower than producer), the codec callback
+        // handler gets stuck waiting on `releaseOutputBuffer`, and dec_us
+        // ratchets up with no recovery until user touch wakes the panel.
+        // FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = "I want this exact rate;
+        // pick the panel mode that doesn't drop frames against my source."
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            try {
+                surface.setFrameRate(fps.toFloat(), FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
+            } catch (t: Throwable) {
+                Log.w(TAG, "Surface.setFrameRate($fps) failed; panel VRR may downclock", t)
+            }
+        }
+
         Log.i(
             TAG,
             "started $mime decoder ${width}x${height}@${fps} on $codecName " +
