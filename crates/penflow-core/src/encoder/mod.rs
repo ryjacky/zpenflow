@@ -13,6 +13,18 @@ use crate::error::EngineResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Codec {
+    /// AVC / H.264. Default for low-latency streaming on Qualcomm Snapdragon
+    /// targets — `c2.qti.avc.decoder.low_latency` exists as a dedicated
+    /// low-latency variant on Adreno (HEVC has no such variant), and
+    /// moonlight-android #1471 documents specific HEVC corruption /
+    /// runaway-latency on Snapdragon 8s Gen 3 that doesn't affect H.264.
+    /// Encode cost on Blackwell NVENC is roughly equal to HEVC (NVENC AppNote
+    /// 13.0); bandwidth is ~1.5× HEVC at equivalent quality but irrelevant
+    /// over USB ADB / USB bulk.
+    H264,
+    /// HEVC / H.265. Lower bandwidth; kept as opt-in for Wi-Fi or other
+    /// bandwidth-constrained transports, or for clients without a stable
+    /// `avc.decoder.low_latency` path.
     Hevc,
 }
 

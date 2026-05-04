@@ -33,11 +33,11 @@ use penflow_core::inject::{PenSample, TouchPoint, TouchState};
 use penflow_core::monitors::MonitorInfo;
 use penflow_core::Engine;
 use penflow_protocol::{
-    encode_frame, extract_hevc_nals, read_frame, write_frame, HelloAndroid, HelloPc, PenEvent,
-    Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame, CODEC_HEVC, FRAME_FLAG_EXTENDED,
-    FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_HELLO_ANDROID, MSG_HELLO_PC, MSG_PC_GOODBYE,
-    MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP,
-    MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
+    encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, HelloAndroid,
+    HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame, CODEC_H264,
+    CODEC_HEVC, FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_HELLO_ANDROID,
+    MSG_HELLO_PC, MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY,
+    MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
 };
 use penflow_transport::{Transport, TransportStream};
 
@@ -141,7 +141,11 @@ impl Default for SessionConfig {
                 attached_to_desktop: false,
                 looks_virtual: false,
             },
-            codec: Codec::Hevc,
+            // H.264 default — see `Codec::H264` doc for rationale (Adreno
+            // c2.qti.avc.decoder.low_latency exists, c2.qti.hevc has known
+            // ratchet bugs on Snapdragon 8s Gen 3 / moonlight #1471).
+            // Bandwidth penalty (~1.5×) is irrelevant over USB transports.
+            codec: Codec::H264,
             bitrate_bps: 50_000_000,
             // 120 fps to match the MovinkPad Pro 14's 120 Hz panel and the
             // VDD config's 120 Hz mode (tools/vdd/vdd_settings.xml). Going
@@ -389,7 +393,16 @@ impl Session {
         //    400-800 ms on hot reconfig).
         let queue = engine.packet_queue();
         let first_pkt = wait_for_keyframe(&queue, Duration::from_secs(5)).await?;
-        let csd0 = extract_hevc_nals(&first_pkt.bytes, &[32, 33, 34]);
+        // Codec-specific parameter-set extraction:
+        //   H.264 csd-0 = SPS (NAL 7) + PPS (NAL 8)
+        //   HEVC  csd-0 = VPS (NAL 32) + SPS (NAL 33) + PPS (NAL 34)
+        let (csd0, codec_wire_id) = match self.cfg.codec {
+            Codec::H264 => (extract_h264_nals(&first_pkt.bytes, &[7, 8]), CODEC_H264),
+            Codec::Hevc => (
+                extract_hevc_nals(&first_pkt.bytes, &[32, 33, 34]),
+                CODEC_HEVC,
+            ),
+        };
         if csd0.is_empty() {
             // Defensive: a keyframe with no parameter sets is a violation
             // of the encoder contract. Fail loudly so the operator knows.
@@ -401,7 +414,7 @@ impl Session {
             protocol_version: 0,
             width: engine.monitor().width.min(u16::MAX as u32) as u16,
             height: engine.monitor().height.min(u16::MAX as u32) as u16,
-            codec: CODEC_HEVC, // matches Codec::Hevc
+            codec: codec_wire_id,
             bitrate_bps: self.cfg.bitrate_bps,
             fps: self.cfg.fps.min(255) as u8,
         };

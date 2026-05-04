@@ -60,7 +60,7 @@ impl EncoderBackend for MfBackend {
         "mf"
     }
     fn supported_codecs(&self) -> &[Codec] {
-        &[Codec::Hevc]
+        &[Codec::H264, Codec::Hevc]
     }
     fn supported_input_formats(&self) -> &[PixelFormat] {
         &[PixelFormat::Nv12]
@@ -71,9 +71,6 @@ impl EncoderBackend for MfBackend {
         ctx: &D3d11Context,
         cfg: SessionConfig,
     ) -> EngineResult<Box<dyn EncodeSession>> {
-        if cfg.codec != Codec::Hevc {
-            return Err(EngineError::NoCompatibleEncoder);
-        }
         if cfg.input_format != PixelFormat::Nv12 {
             return Err(EngineError::NoCompatibleEncoder);
         }
@@ -128,8 +125,10 @@ impl MfSession {
     fn new(ctx: &D3d11Context, cfg: SessionConfig) -> EngineResult<Self> {
         ensure_mf_started()?;
 
-        // 1. Pick the right MFT for our adapter (gate-1 vendor-ID match).
-        let activate = pick_mft_for_adapter(ctx.adapter_vendor_id)?;
+        // 1. Pick the right MFT for our adapter + codec (gate-1 vendor-ID
+        //    match plus subtype filter so we get NVIDIA's H.264 MFT vs the
+        //    HEVC one based on `cfg.codec`).
+        let activate = pick_mft_for_adapter(ctx.adapter_vendor_id, cfg.codec)?;
         let transform: IMFTransform = unsafe { activate.ActivateObject()? };
 
         // 2. Async-unlock BEFORE anything else (gate-1 finding).
@@ -143,9 +142,9 @@ impl MfSession {
             transform.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, dev_mgr.as_raw() as usize)?;
         }
 
-        // 4. Output type (HEVC) — must include MF_MT_MPEG2_PROFILE.
+        // 4. Output type — codec-specific subtype + profile.
         let out_type = unsafe { MFCreateMediaType()? };
-        configure_hevc_output_type(&out_type, &cfg)?;
+        configure_video_output_type(&out_type, &cfg)?;
         unsafe { transform.SetOutputType(0, &out_type, 0)? };
 
         // 5. Input type (NV12) — colour-space attrs on this side.
@@ -298,8 +297,10 @@ impl MfSession {
             }
         };
 
-        let is_keyframe = first_nal_is_idr(&bytes);
-        // First IDR carries VPS+SPS+PPS; cache them for the protocol layer.
+        let is_keyframe = first_nal_is_idr(&bytes, self.cfg.codec);
+        // First IDR carries the codec's parameter sets (HEVC: VPS+SPS+PPS;
+        // H.264: SPS+PPS); cache the whole packet so the protocol layer
+        // can extract csd-0.
         if is_keyframe && self.sequence_header.is_empty() {
             self.sequence_header = bytes.clone();
         }
@@ -413,10 +414,13 @@ impl Drop for MfSession {
 
 // ----------------- helpers (mirror the gate-1 probe) -----------------
 
-fn pick_mft_for_adapter(adapter_vendor_id: u32) -> EngineResult<IMFActivate> {
+fn pick_mft_for_adapter(adapter_vendor_id: u32, codec: Codec) -> EngineResult<IMFActivate> {
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
-        guidSubtype: MFVideoFormat_HEVC,
+        guidSubtype: match codec {
+            Codec::H264 => MFVideoFormat_H264,
+            Codec::Hevc => MFVideoFormat_HEVC,
+        },
     };
     let mut activate_arr: *mut Option<IMFActivate> = ptr::null_mut();
     let mut count: u32 = 0;
@@ -481,17 +485,27 @@ fn create_dev_mgr(ctx: &D3d11Context) -> EngineResult<IMFDXGIDeviceManager> {
     Ok(mgr)
 }
 
-fn configure_hevc_output_type(t: &IMFMediaType, cfg: &SessionConfig) -> EngineResult<()> {
+fn configure_video_output_type(t: &IMFMediaType, cfg: &SessionConfig) -> EngineResult<()> {
+    let (subtype, profile) = match cfg.codec {
+        // H.264 Main profile (77) — Baseline drops CABAC and adds nothing
+        // we want; High adds 8x8 transform that some Adreno LL paths
+        // de-optimize. Main with B-pictures = 0 (set via codec API
+        // below) is the standard low-latency choice and matches
+        // moonlight's preferred profile.
+        Codec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_Main.0 as u32),
+        // HEVC Main 4:2:0 8-bit — required attribute on NVIDIA's HEVC
+        // MFT (gate-1 finding).
+        Codec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
+    };
     unsafe {
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_HEVC)?;
+        t.SetGUID(&MF_MT_SUBTYPE, &subtype)?;
         t.SetUINT32(&MF_MT_AVG_BITRATE, cfg.bitrate_bps)?;
         t.SetUINT64(&MF_MT_FRAME_SIZE, pack_2u32(cfg.width, cfg.height))?;
         t.SetUINT64(&MF_MT_FRAME_RATE, pack_2u32(cfg.fps, 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2u32(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        // Required by NVIDIA's HEVC MFT — gate-1 finding.
-        t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH265VProfile_Main_420_8.0 as u32)?;
+        t.SetUINT32(&MF_MT_MPEG2_PROFILE, profile)?;
     }
     Ok(())
 }
@@ -556,9 +570,12 @@ fn read_sample_bytes(sample: &IMFSample) -> EngineResult<Vec<u8>> {
     Ok(bytes)
 }
 
-fn first_nal_is_idr(bytes: &[u8]) -> bool {
-    // Walk Annex-B start codes, classify the first VCL NAL we see. VCL types
-    // for HEVC are 0..=31; IDR_W_RADL=19 / IDR_N_LP=20 / CRA=21.
+fn first_nal_is_idr(bytes: &[u8], codec: Codec) -> bool {
+    // Walk Annex-B start codes, classify the first VCL NAL we see.
+    //   HEVC: header is 2 bytes, nal_unit_type = (byte0 >> 1) & 0x3F.
+    //         VCL types are 0..=31; IDR_W_RADL=19 / IDR_N_LP=20 / CRA=21.
+    //   H.264: header is 1 byte, nal_unit_type = byte0 & 0x1F.
+    //         VCL types are 1..=5; IDR slice = 5.
     let mut i = 0;
     while i + 3 < bytes.len() {
         let off = if bytes[i..].starts_with(&[0, 0, 0, 1]) {
@@ -572,12 +589,24 @@ fn first_nal_is_idr(bytes: &[u8]) -> bool {
         if off >= bytes.len() {
             break;
         }
-        let nal_type = (bytes[off] >> 1) & 0x3F;
-        if nal_type < 32 {
-            return matches!(nal_type, 19 | 20 | 21);
+        match codec {
+            Codec::H264 => {
+                let nal_type = bytes[off] & 0x1F;
+                if (1..=5).contains(&nal_type) {
+                    return nal_type == 5;
+                }
+                // Non-VCL (SPS/PPS/SEI/AUD); keep scanning.
+                i = off + 1;
+            }
+            Codec::Hevc => {
+                let nal_type = (bytes[off] >> 1) & 0x3F;
+                if nal_type < 32 {
+                    return matches!(nal_type, 19 | 20 | 21);
+                }
+                // Non-VCL; keep scanning.
+                i = off + 2;
+            }
         }
-        // Non-VCL; keep scanning.
-        i = off + 2;
     }
     false
 }
@@ -587,11 +616,7 @@ mod tests {
     use super::*;
     use crate::color::{create_bgra_keepalive_texture, ColorConverter};
 
-    /// End-to-end smoke: build an MfBackend session and submit a few black
-    /// frames, expect at least one IDR packet back. Mirrors the gate-1 probe
-    /// but goes through the production trait so we catch trait-shape bugs.
-    #[test]
-    fn session_emits_keyframe() {
+    fn run_codec_smoke(codec: Codec) {
         let backend = MfBackend::new().expect("MfBackend");
         let ctx = D3d11Context::create_high_perf().expect("d3d11 ctx");
         let cfg = SessionConfig {
@@ -599,11 +624,10 @@ mod tests {
             height: 720,
             fps: 60,
             bitrate_bps: 5_000_000,
-            codec: Codec::Hevc,
+            codec,
             input_format: PixelFormat::Nv12,
         };
         let mut session = backend.make_session(&ctx, cfg).expect("session");
-
         let conv = ColorConverter::new(&ctx, cfg.width, cfg.height, cfg.fps).expect("conv");
         let bgra = create_bgra_keepalive_texture(&ctx.device, cfg.width, cfg.height).expect("bgra");
 
@@ -615,7 +639,6 @@ mod tests {
             session
                 .submit_frame(conv.output_texture(), i as i64 * 16_666_667, force_idr)
                 .expect("submit");
-            // Drain whatever's ready so we don't backlog.
             while let Some(pkt) = session.try_packet().expect("try_packet") {
                 packets += 1;
                 if pkt.is_keyframe {
@@ -623,7 +646,6 @@ mod tests {
                 }
             }
         }
-        // Allow extra polling cycles so trailing frames flush.
         for _ in 0..30 {
             while let Some(pkt) = session.try_packet().expect("try_packet drain") {
                 packets += 1;
@@ -632,7 +654,23 @@ mod tests {
                 }
             }
         }
-        assert!(packets >= 1, "encoder produced zero packets");
-        assert!(got_idr, "no keyframe seen across 30 inputs");
+        assert!(packets >= 1, "{codec:?}: encoder produced zero packets");
+        assert!(got_idr, "{codec:?}: no keyframe seen across 30 inputs");
+    }
+
+    /// End-to-end smoke: build an MfBackend session and submit a few black
+    /// frames, expect at least one IDR packet back. Mirrors the gate-1 probe
+    /// but goes through the production trait so we catch trait-shape bugs.
+    #[test]
+    fn session_emits_keyframe() {
+        run_codec_smoke(Codec::Hevc);
+    }
+
+    /// Same as `session_emits_keyframe` but for H.264 — verifies the new
+    /// codec dispatch in `pick_mft_for_adapter` / `configure_video_output_type`
+    /// / `first_nal_is_idr` actually works on the dev rig's NVIDIA H.264 MFT.
+    #[test]
+    fn session_emits_keyframe_h264() {
+        run_codec_smoke(Codec::H264);
     }
 }
