@@ -561,7 +561,16 @@ impl TimeSyncResp {
 }
 
 // =====================================================================
-// HEVC parameter-set helpers (used to derive csd-0 from the first keyframe).
+// Parameter-set extraction (HEVC + H.264) — used to derive csd-0 from the
+// first keyframe packet.
+//
+// HEVC and H.264 use **different NAL header layouts**:
+//   - H.264:  1-byte header. nal_unit_type = byte[0] & 0x1F.
+//             Important: 7 = SPS, 8 = PPS, 5 = IDR slice.
+//   - HEVC:   2-byte header. nal_unit_type = (byte[0] >> 1) & 0x3F.
+//             Important: 32 = VPS, 33 = SPS, 34 = PPS, 19/20/21 = IDR/CRA.
+//
+// Start codes (`00 00 00 01` or `00 00 01`) are identical in both.
 // =====================================================================
 
 /// Walk an HEVC Annex-B byte stream and return the bytes from start codes
@@ -571,8 +580,19 @@ impl TimeSyncResp {
 /// first keyframe packet for `MSG_VIDEO_CONFIG` (csd-0).
 pub fn extract_hevc_nals(annex_b: &[u8], keep_types: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    let nals = split_hevc_nals(annex_b);
-    for (start_off, end_off, nal_type) in nals {
+    for (start_off, end_off, nal_type) in split_hevc_nals(annex_b) {
+        if keep_types.contains(&nal_type) {
+            out.extend_from_slice(&annex_b[start_off..end_off]);
+        }
+    }
+    out
+}
+
+/// H.264 counterpart to [`extract_hevc_nals`]. Used to extract SPS+PPS
+/// (types 7, 8) from the first keyframe for `MSG_VIDEO_CONFIG`.
+pub fn extract_h264_nals(annex_b: &[u8], keep_types: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (start_off, end_off, nal_type) in split_h264_nals(annex_b) {
         if keep_types.contains(&nal_type) {
             out.extend_from_slice(&annex_b[start_off..end_off]);
         }
@@ -585,8 +605,19 @@ pub fn extract_hevc_nals(annex_b: &[u8], keep_types: &[u8]) -> Vec<u8> {
 /// the leading start code (`00 00 00 01` or `00 00 01`), `end_offset` is the
 /// next start code or `bytes.len()`.
 pub fn split_hevc_nals(bytes: &[u8]) -> Vec<(usize, usize, u8)> {
-    let mut out = Vec::new();
-    // Find every start code.
+    split_nals(bytes, |b| (b >> 1) & 0x3F)
+}
+
+/// H.264 counterpart to [`split_hevc_nals`]. The only difference is the
+/// NAL-type extraction (`byte & 0x1F` for H.264 vs `(byte >> 1) & 0x3F`
+/// for HEVC), since H.264 uses a 1-byte NAL header.
+pub fn split_h264_nals(bytes: &[u8]) -> Vec<(usize, usize, u8)> {
+    split_nals(bytes, |b| b & 0x1F)
+}
+
+/// Shared start-code walker. The `nal_type_from_header_byte` closure pulls
+/// the codec-specific NAL type bits out of the first header byte.
+fn split_nals<F: Fn(u8) -> u8>(bytes: &[u8], nal_type_from_header_byte: F) -> Vec<(usize, usize, u8)> {
     let mut starts: Vec<(usize, usize)> = Vec::new(); // (start_off, payload_off)
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -600,6 +631,7 @@ pub fn split_hevc_nals(bytes: &[u8]) -> Vec<(usize, usize, u8)> {
             i += 1;
         }
     }
+    let mut out = Vec::with_capacity(starts.len());
     for k in 0..starts.len() {
         let (start_off, payload_off) = starts[k];
         let end_off = if k + 1 < starts.len() {
@@ -610,8 +642,7 @@ pub fn split_hevc_nals(bytes: &[u8]) -> Vec<(usize, usize, u8)> {
         if payload_off >= bytes.len() {
             continue;
         }
-        let nal_type = (bytes[payload_off] >> 1) & 0x3F;
-        out.push((start_off, end_off, nal_type));
+        out.push((start_off, end_off, nal_type_from_header_byte(bytes[payload_off])));
     }
     out
 }
@@ -776,6 +807,42 @@ mod tests {
         // Three NAL units of 4 (start code) + 3 (header + payload byte) = 21 bytes.
         assert_eq!(csd0.len(), 3 * 7);
         // First byte of each retained NAL is a start code.
+        assert_eq!(&csd0[0..4], &[0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn split_h264_nals_separates_units() {
+        // Synthesize an Annex-B stream with the NAL types we care about for
+        // H.264 csd-0 + IDR detection. H.264's 1-byte NAL header packs the
+        // type into the low 5 bits.
+        //   type 7 (SPS) → header byte 0x67 (forbidden=0, ref=3, type=7)
+        //   type 8 (PPS) → header byte 0x68
+        //   type 5 (IDR slice) → header byte 0x65
+        //   type 1 (non-IDR slice) → header byte 0x41
+        let mut bytes: Vec<u8> = Vec::new();
+        for (sc4, hdr) in [
+            (true, 0x67u8),  // SPS
+            (false, 0x68),   // PPS
+            (true, 0x65),    // IDR
+            (false, 0x41),   // non-IDR slice
+        ] {
+            if sc4 {
+                bytes.extend_from_slice(&[0, 0, 0, 1]);
+            } else {
+                bytes.extend_from_slice(&[0, 0, 1]);
+            }
+            bytes.push(hdr);
+            bytes.push(0xff); // dummy payload
+        }
+        let nals = split_h264_nals(&bytes);
+        let types: Vec<u8> = nals.iter().map(|(_, _, t)| *t).collect();
+        assert_eq!(types, vec![7, 8, 5, 1]);
+
+        let csd0 = extract_h264_nals(&bytes, &[7, 8]);
+        // SPS: 4 (start code) + 1 (header) + 1 (payload) = 6
+        // PPS: 3 (start code) + 1 + 1 = 5
+        // Total 11 bytes.
+        assert_eq!(csd0.len(), 6 + 5);
         assert_eq!(&csd0[0..4], &[0, 0, 0, 1]);
     }
 }
