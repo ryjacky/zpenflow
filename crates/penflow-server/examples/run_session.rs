@@ -157,6 +157,18 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let transport: Arc<dyn Transport> = if args.usb {
         println!("[run_session] starting USB AOA accessory transport...");
+        // ADB's WinUSB driver instance claims the Android device's
+        // interface 0 — which blocks our control transfer for AOA
+        // GET_PROTOCOL. Kill the daemon up front so nusb can talk to
+        // the raw device. Once AOA negotiation succeeds the device
+        // re-enumerates as 0x18D1:0x2D01 (accessory + ADB) and adbd
+        // is welcome to re-attach to the new interface.
+        println!("[run_session]   stopping adb-server so the USB device is unclaimed...");
+        let _ = std::process::Command::new("adb")
+            .arg("kill-server")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
         println!(
             "[run_session]   PC will negotiate AOA mode with the first attached \
              Android device, the device will re-enumerate as a Google accessory, \

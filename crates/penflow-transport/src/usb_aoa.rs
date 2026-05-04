@@ -201,28 +201,72 @@ impl Transport for UsbAoaTransport {
 // ===================================================================
 
 /// Find an Android device that's either already in AOA mode or
-/// supports AOA negotiation.
+/// supports AOA negotiation. Logs each enumerated device and the
+/// reason for skipping non-candidates so it's clear why a device the
+/// operator expects to see was rejected.
 fn pick_candidate_device() -> io::Result<DeviceInfo> {
     let devices: Vec<DeviceInfo> = nusb::list_devices().map_err(io_other)?.collect();
+    eprintln!("[usb_aoa] enumerating {} USB device(s):", devices.len());
+    for d in &devices {
+        eprintln!(
+            "  VID:PID = {:04X}:{:04X}  class={:#04x}  bus={} addr={}  manufacturer={:?} product={:?}",
+            d.vendor_id(),
+            d.product_id(),
+            d.class(),
+            d.bus_number(),
+            d.device_address(),
+            d.manufacturer_string(),
+            d.product_string(),
+        );
+    }
 
     if let Some(d) = devices.iter().find(|d| {
         d.vendor_id() == GOOGLE_VID
             && (d.product_id() == ACCESSORY_PID || d.product_id() == ACCESSORY_ADB_PID)
     }) {
+        eprintln!(
+            "[usb_aoa] found device already in AOA mode: {:04X}:{:04X}",
+            d.vendor_id(),
+            d.product_id()
+        );
         return Ok(d.clone());
     }
 
     // Probe each plausible device with GET_PROTOCOL.
-    for d in devices.iter().filter(|d| !is_obviously_not_android(d)) {
-        if probe_aoa_version(d).is_ok() {
-            return Ok(d.clone());
+    for d in &devices {
+        if is_obviously_not_android(d) {
+            eprintln!(
+                "[usb_aoa]   skip {:04X}:{:04X}: class {:#04x} is not Android-class",
+                d.vendor_id(),
+                d.product_id(),
+                d.class()
+            );
+            continue;
+        }
+        eprintln!(
+            "[usb_aoa]   probing {:04X}:{:04X} for AOA support...",
+            d.vendor_id(),
+            d.product_id()
+        );
+        match probe_aoa_version(d) {
+            Ok(v) => {
+                eprintln!("[usb_aoa]     OK — AOA version {v}");
+                return Ok(d.clone());
+            }
+            Err(e) => {
+                eprintln!("[usb_aoa]     skip: {e}");
+            }
         }
     }
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "no Android device with AOA support found — check USB cable, \
-         debugging permission, and that no other process holds the device",
+        "no Android device with AOA support found. Common causes on Windows:\n\
+         (1) `adb` server has the device claimed — run `adb kill-server` first;\n\
+         (2) the device's interface 0 uses a vendor driver that blocks WinUSB \
+             (you may need Zadig to bind WinUSB);\n\
+         (3) USB debugging is disabled on the device (toggle it off then on \
+             so the driver re-binds).",
     ))
 }
 
