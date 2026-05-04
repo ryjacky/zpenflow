@@ -487,12 +487,25 @@ fn create_dev_mgr(ctx: &D3d11Context) -> EngineResult<IMFDXGIDeviceManager> {
 
 fn configure_video_output_type(t: &IMFMediaType, cfg: &SessionConfig) -> EngineResult<()> {
     let (subtype, profile) = match cfg.codec {
-        // H.264 Main profile (77) — Baseline drops CABAC and adds nothing
-        // we want; High adds 8x8 transform that some Adreno LL paths
-        // de-optimize. Main with B-pictures = 0 (set via codec API
-        // below) is the standard low-latency choice and matches
-        // moonlight's preferred profile.
-        Codec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_Main.0 as u32),
+        // H.264 **ConstrainedBaseline** profile. The standard claim that
+        // "Main is fine if you set B-pictures = 0" turns out to be wrong
+        // on Adreno: NVENC's Main-profile SPS still writes
+        // `max_num_ref_frames = N` (typically 4) and the c2.qti.avc.
+        // decoder.low_latency component honours that — bumping its
+        // output delay to 24-31 frames after seeing the first coded
+        // bytes (~400 ms of decoder-internal buffering at 60 fps,
+        // which the user observed as 100 ms+ spikes during heavy
+        // motion). Baseline forces `max_num_ref_frames = 1`, no
+        // B-frames, no CABAC, no reordering — exactly the
+        // videoconference profile, exactly what we want.
+        // ConstrainedBaseline (Baseline + the constraint flags Adreno
+        // checks for its hot path) is the same syntax + an extra bit
+        // in the SPS that lets the decoder skip the legacy Baseline-
+        // only modes (FMO/ASO) it doesn't actually need.
+        Codec::H264 => (
+            MFVideoFormat_H264,
+            eAVEncH264VProfile_ConstrainedBase.0 as u32,
+        ),
         // HEVC Main 4:2:0 8-bit — required attribute on NVIDIA's HEVC
         // MFT (gate-1 finding).
         Codec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
