@@ -165,10 +165,12 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = SessionConfig {
         monitor: fallback_monitor.clone(),
-        // H.264 default — see `Codec::H264` in encoder/mod.rs for rationale
-        // (Adreno c2.qti.avc.decoder.low_latency exists, c2.qti.hevc has
-        // known ratchet bugs on Snapdragon 8s Gen 3, moonlight #1471).
-        codec: Codec::H264,
+        // HEVC + the `.low_latency` decoder variant on Adreno is the
+        // measured-best combo on the dev rig (~7-9 ms decode steady).
+        // The H.264 path costs more on the decoder side because NVENC's
+        // H.264 SPS inflates max_num_ref_frames — see SessionConfig
+        // default in session.rs for the full story.
+        codec: Codec::Hevc,
         bitrate_bps: args.bitrate_bps,
         fps: args.fps,
         vdd,

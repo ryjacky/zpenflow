@@ -141,11 +141,21 @@ impl Default for SessionConfig {
                 attached_to_desktop: false,
                 looks_virtual: false,
             },
-            // H.264 default — see `Codec::H264` doc for rationale (Adreno
-            // c2.qti.avc.decoder.low_latency exists, c2.qti.hevc has known
-            // ratchet bugs on Snapdragon 8s Gen 3 / moonlight #1471).
-            // Bandwidth penalty (~1.5×) is irrelevant over USB transports.
-            codec: Codec::H264,
+            // HEVC default. Earlier research suggested H.264 because
+            // moonlight-android #1471 documents HEVC issues on Snapdragon
+            // 8s Gen 3 — but the actual fix was selecting the
+            // `.low_latency` decoder variant explicitly (which works
+            // for BOTH avc and hevc on this silicon, contrary to the
+            // initial assumption that only AVC had one). HEVC +
+            // c2.qti.hevc.decoder.low_latency measured ~7-9 ms steady
+            // on the dev rig; H.264 + ConstrainedBaseline +
+            // c2.qti.avc.decoder.low_latency measured ~15 ms steady
+            // because NVENC's H.264 SPS still inflates max_num_ref_frames
+            // and Adreno's AVC LL path honours that, expanding the DPB.
+            // HEVC's low-latency component handles its own SPS more
+            // cleanly. H.264 is kept as `Codec::H264` for clients that
+            // need it (e.g. older devices without HEVC decode).
+            codec: Codec::Hevc,
             bitrate_bps: 50_000_000,
             // 120 fps to match the MovinkPad Pro 14's 120 Hz panel and the
             // VDD config's 120 Hz mode (tools/vdd/vdd_settings.xml). Going
