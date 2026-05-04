@@ -170,6 +170,18 @@ impl MfSession {
         // backends that don't expose the property is fine.
         let _ = set_codec_bool(&codec_api, &CODECAPI_AVEncCommonRealTime, true);
         let _ = set_codec_ui4(&codec_api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+        // **Constrain the SPS DPB requirement to 1**. NVIDIA's MFT
+        // defaults to `max_num_ref_frames = 4` (H.264) /
+        // `sps_max_dec_pic_buffering_minus1 = 3` (HEVC) in the bitstream
+        // it emits, EVEN under MF_LOW_LATENCY=1. Adreno's
+        // `c2.qti.{avc,hevc}.decoder.low_latency` components honour the
+        // SPS: they parse `max_num_ref_frames` / `max_dec_pic_buffering`
+        // and bump their internal output_delay to match (24 frames /
+        // ~400 ms at 60 fps), nuking the whole point of selecting the
+        // .low_latency variant. Forcing `MaxNumRefFrame = 1` makes
+        // NVENC write a 1-deep DPB, which the decoder reflects with
+        // output_delay = 1.
+        let _ = set_codec_ui4(&codec_api, &CODECAPI_AVEncVideoMaxNumRefFrame, 1);
         // Long GOP — we drive IDR on demand (gate-1 PASS). If a backend
         // ignores ForceKeyFrame, the design §6.4.1 fallback is to set this to
         // a small value (fps × 2) for periodic IDR; that lives outside the
