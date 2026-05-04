@@ -123,14 +123,23 @@ pub fn encode_frame(msg_id: u8, payload: &[u8]) -> Vec<u8> {
 /// Write one framed message to the given `AsyncWrite`. Does NOT flush —
 /// callers wanting immediate delivery should call `.flush().await` themselves
 /// (or use `BufWriter` and let it drain on drop).
+///
+/// **Single allocation, single `write_all`**. The earlier implementation
+/// did three separate writes (`write_u8` + `write_u32` + `write_all`),
+/// which TCP / ADB-localabstract handled fine via byte streaming, but
+/// USB bulk endpoints translated each write into a separate USB
+/// transfer — and Android's USB-accessory file descriptor doesn't always
+/// aggregate packet boundaries across reads, so the receiving side
+/// could misalign on the next length field. Buffering into one Vec
+/// produces exactly one `bulk_out` per message and keeps both
+/// transports happy.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     w: &mut W,
     msg_id: u8,
     payload: &[u8],
 ) -> Result<(), ProtocolError> {
-    w.write_u8(msg_id).await?;
-    w.write_u32(payload.len() as u32).await?;
-    w.write_all(payload).await?;
+    let bytes = encode_frame(msg_id, payload);
+    w.write_all(&bytes).await?;
     Ok(())
 }
 
