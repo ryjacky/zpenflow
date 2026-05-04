@@ -290,16 +290,57 @@ impl MfSession {
         let finished_at = Instant::now();
 
         let raw_bytes = read_sample_bytes(&sample)?;
-        // Patch SPS NAL(s) inside this packet to declare a 1-deep DPB
-        // and 0 reorder frames. This is the workaround for Adreno
-        // c2.qti.{avc,hevc}.decoder paced output_delay against SPS
-        // declarations rather than actual usage — see sps_patcher
-        // module docs. NVENC's MFT writes max_num_ref_frames > 1 by
-        // default and `CODECAPI_AVEncVideoMaxNumRefFrame` doesn't
-        // override it. Patching the bitstream after-the-fact does.
-        // No-op for packets without SPS (P-frames etc.).
-        let bytes = super::sps_patcher::patch_packet_for_low_latency_dpb(self.cfg.codec, &raw_bytes)
-            .unwrap_or(raw_bytes);
+        // Patch SPS NAL(s) — see sps_patcher module docs.
+        let bytes = match super::sps_patcher::patch_packet_for_low_latency_dpb(
+            self.cfg.codec,
+            &raw_bytes,
+        ) {
+            Ok(patched) => {
+                // One-shot diagnostic on the first SPS-containing packet:
+                // dump the SPS NAL bytes pre/post so we can verify the
+                // patch actually took effect (and didn't silently
+                // fall back via `unwrap_or` due to a parser error).
+                static FIRST_DUMP: std::sync::Once = std::sync::Once::new();
+                FIRST_DUMP.call_once(|| {
+                    let raw_sps = find_sps_nal(self.cfg.codec, &raw_bytes);
+                    let new_sps = find_sps_nal(self.cfg.codec, &patched);
+                    if let (Some(r), Some(n)) = (raw_sps, new_sps) {
+                        eprintln!(
+                            "[sps_patcher] codec={:?} first SPS pre-patch ({} B): {}",
+                            self.cfg.codec,
+                            r.len(),
+                            hex_dump(r),
+                        );
+                        eprintln!(
+                            "[sps_patcher] codec={:?} first SPS post-patch ({} B): {}",
+                            self.cfg.codec,
+                            n.len(),
+                            hex_dump(n),
+                        );
+                        if r == n {
+                            eprintln!(
+                                "[sps_patcher] WARNING: post-patch SPS bytes are IDENTICAL to pre-patch"
+                            );
+                        }
+                    } else {
+                        eprintln!(
+                            "[sps_patcher] codec={:?} no SPS NAL found in first packet ({} B)",
+                            self.cfg.codec,
+                            raw_bytes.len()
+                        );
+                    }
+                });
+                patched
+            }
+            Err(e) => {
+                eprintln!(
+                    "[sps_patcher] codec={:?} patch FAILED: {:?} (falling back to raw bytes — \
+                     decoder will see encoder's original SPS)",
+                    self.cfg.codec, e
+                );
+                raw_bytes
+            }
+        };
         // Match MF's preserved 1:1 input/output ordering: the head of the
         // meta FIFO corresponds to this output. Use the meta's pts_ns
         // (caller-supplied, exact ns) over `sample.GetSampleTime()`'s
@@ -589,6 +630,69 @@ fn set_codec_bool(codec: &ICodecAPI, key: &GUID, value: bool) -> EngineResult<()
 
 fn pack_2u32(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | (lo as u64)
+}
+
+/// One-shot diagnostic: locate the FIRST SPS NAL in an Annex-B stream
+/// and return the start-code + NAL header + RBSP slice. Used only by
+/// the FIRST_DUMP debug print in `collect_output_packet`.
+fn find_sps_nal<'a>(codec: Codec, bytes: &'a [u8]) -> Option<&'a [u8]> {
+    let target_type: u8 = match codec {
+        Codec::H264 => 7,
+        Codec::Hevc => 33,
+    };
+    let header_len: usize = match codec {
+        Codec::H264 => 1,
+        Codec::Hevc => 2,
+    };
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        let (sc_len, payload_off) = if bytes[i..].starts_with(&[0, 0, 0, 1]) {
+            (4, i + 4)
+        } else if bytes[i..].starts_with(&[0, 0, 1]) {
+            (3, i + 3)
+        } else {
+            i += 1;
+            continue;
+        };
+        if payload_off + header_len > bytes.len() {
+            return None;
+        }
+        let nal_type = match codec {
+            Codec::H264 => bytes[payload_off] & 0x1F,
+            Codec::Hevc => (bytes[payload_off] >> 1) & 0x3F,
+        };
+        if nal_type == target_type {
+            // Find end = next start code or EOF.
+            let mut j = payload_off;
+            let end = loop {
+                if j + 3 > bytes.len() {
+                    break bytes.len();
+                }
+                if bytes[j..].starts_with(&[0, 0, 0, 1]) || bytes[j..].starts_with(&[0, 0, 1]) {
+                    break j;
+                }
+                j += 1;
+            };
+            return Some(&bytes[i..end]);
+        }
+        i = payload_off;
+        let _ = sc_len;
+    }
+    None
+}
+
+fn hex_dump(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && i % 16 == 0 {
+            s.push('\n');
+            s.push_str("                ");
+        } else if i > 0 {
+            s.push(' ');
+        }
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 fn read_sample_bytes(sample: &IMFSample) -> EngineResult<Vec<u8>> {

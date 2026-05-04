@@ -15,6 +15,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(any(unix, windows))]
 pub mod adb;
+#[cfg(any(unix, windows))]
+pub mod usb_aoa;
 
 /// One bidirectional byte stream to the connected Android client.
 ///
