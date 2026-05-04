@@ -22,6 +22,7 @@ use penflow_core::Engine;
 use penflow_server::vdd;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
+use penflow_transport::usb_aoa::{AccessoryStrings, UsbAoaTransport};
 use penflow_transport::Transport;
 
 fn main() -> ExitCode {
@@ -154,14 +155,24 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("[run_session] starting ADB reverse tunnel...");
-    let transport: Arc<dyn Transport> = Arc::new(
-        AdbLocalAbstractTransport::bind("penflow")
-            .await
-            .map_err(|e| format!("ADB transport bind failed: {e}. Is `adb` on PATH and a device attached?"))?,
-    );
+    let transport: Arc<dyn Transport> = if args.usb {
+        println!("[run_session] starting USB AOA accessory transport...");
+        println!(
+            "[run_session]   PC will negotiate AOA mode with the first attached \
+             Android device, the device will re-enumerate as a Google accessory, \
+             and the Penflow app should launch via the USB_ACCESSORY_ATTACHED intent."
+        );
+        Arc::new(UsbAoaTransport::new(AccessoryStrings::default_penflow()))
+    } else {
+        println!("[run_session] starting ADB reverse tunnel...");
+        Arc::new(
+            AdbLocalAbstractTransport::bind("penflow")
+                .await
+                .map_err(|e| format!("ADB transport bind failed: {e}. Is `adb` on PATH and a device attached?"))?,
+        )
+    };
 
-    println!("[run_session] tunnel ready. Launch the Penflow app on the device now.");
+    println!("[run_session] transport ready. Launch the Penflow app on the device now.");
 
     let cfg = SessionConfig {
         monitor: fallback_monitor.clone(),
@@ -272,6 +283,12 @@ struct Args {
     /// `--vdd-probe`: enable VDD, attach display topology, wait for DXGI,
     /// then disable it again. Does not start ADB or wait for Android.
     vdd_probe: bool,
+    /// `--usb`: use the AOA USB bulk transport instead of ADB
+    /// localabstract. The Android client must have the
+    /// `USB_ACCESSORY_ATTACHED` intent filter active (see
+    /// `android/app/src/main/AndroidManifest.xml` and
+    /// `res/xml/accessory_filter.xml`).
+    usb: bool,
 }
 
 fn parse_args() -> Args {
@@ -281,6 +298,7 @@ fn parse_args() -> Args {
         fps: 120,
         no_vdd: false,
         vdd_probe: false,
+        usb: false,
     };
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -309,6 +327,9 @@ fn parse_args() -> Args {
             }
             "--vdd-probe" => {
                 a.vdd_probe = true;
+            }
+            "--usb" => {
+                a.usb = true;
             }
             other => {
                 eprintln!("[run_session] ignoring unknown arg: {other}");

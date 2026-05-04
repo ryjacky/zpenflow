@@ -9,6 +9,11 @@ import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * Top-level entry. Wires the Surface, the network client, and the pen
@@ -96,7 +101,42 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        client.connect(detectDeviceCaps())
+        // Prefer USB accessory transport when an Android Open Accessory
+        // device is plugged in: bypasses ADB entirely (no daemon, no
+        // localabstract socket, no TCP-over-USB framing). Falls back to
+        // ADB localabstract for development / when no accessory is
+        // present.
+        //
+        // Two paths to detect an accessory:
+        //   1. We were *launched* by the platform's USB_ACCESSORY_ATTACHED
+        //      intent (intent.action matches → accessory in extras).
+        //   2. We were already foreground when the accessory plugged
+        //      in / re-enumerated → ask UsbManager.
+        val accessory = UsbAccessoryConnection.extractAccessoryFromIntent(intent)
+            ?: UsbAccessoryConnection.firstConnectedAccessory(this)
+        if (accessory != null) {
+            connectViaUsbAccessory(accessory)
+        } else {
+            client.connect(detectDeviceCaps())
+        }
+    }
+
+    private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    private fun connectViaUsbAccessory(accessory: android.hardware.usb.UsbAccessory) {
+        val ctx = this
+        val caps = detectDeviceCaps()
+        activityScope.launch {
+            try {
+                UsbAccessoryConnection.requestPermissionIfNeeded(ctx, accessory)
+                val streams = UsbAccessoryConnection.open(ctx, accessory)
+                Log.i(TAG, "USB accessory transport ready: ${streams.accessoryLabel}")
+                client.connectViaStreams(streams.input, streams.output, caps)
+            } catch (t: Throwable) {
+                Log.e(TAG, "USB accessory connect failed; falling back to ADB", t)
+                runOnUiThread { client.connect(caps) }
+            }
+        }
     }
 
     override fun onStop() {
@@ -106,6 +146,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         client.close()
+        activityScope.cancel()
         super.onDestroy()
     }
 

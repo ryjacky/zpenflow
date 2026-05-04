@@ -104,6 +104,7 @@ class PenflowClient(
         )
     }
 
+    /** Connect via the ADB localabstract socket (default / development path). */
     fun connect(deviceCaps: DeviceCaps) {
         scope.launch {
             try {
@@ -115,8 +116,46 @@ class PenflowClient(
                 val out = DataOutputStream(sock.outputStream)
                 val input = DataInputStream(sock.inputStream)
                 output = out
+                handshakeAndPump(input, out, deviceCaps)
+            } catch (t: Throwable) {
+                Log.e(TAG, "ADB connect failed", t)
+                onState(State.Error(t.message ?: t.javaClass.simpleName))
+                disconnect()
+            }
+        }
+    }
 
-                // 1. send HELLO_ANDROID
+    /**
+     * Connect via pre-opened streams (e.g. from a USB accessory's
+     * `ParcelFileDescriptor`). Used by the AOA path — see
+     * [UsbAccessoryConnection].
+     */
+    fun connectViaStreams(
+        rawInput: java.io.InputStream,
+        rawOutput: java.io.OutputStream,
+        deviceCaps: DeviceCaps,
+    ) {
+        scope.launch {
+            try {
+                onState(State.Connecting)
+                val out = DataOutputStream(rawOutput)
+                val input = DataInputStream(rawInput)
+                output = out
+                handshakeAndPump(input, out, deviceCaps)
+            } catch (t: Throwable) {
+                Log.e(TAG, "stream connect failed", t)
+                onState(State.Error(t.message ?: t.javaClass.simpleName))
+                disconnect()
+            }
+        }
+    }
+
+    private suspend fun handshakeAndPump(
+        input: DataInputStream,
+        out: DataOutputStream,
+        deviceCaps: DeviceCaps,
+    ) {
+        // 1. send HELLO_ANDROID
                 Protocol.sendMsg(
                     out,
                     Protocol.MSG_HELLO_ANDROID,
@@ -172,12 +211,6 @@ class PenflowClient(
 
                 // 8. single-consumer touch sender
                 touchSendJob = scope.launch { touchSendLoop(out) }
-            } catch (t: Throwable) {
-                Log.e(TAG, "connect failed", t)
-                onState(State.Error(t.message ?: t.javaClass.simpleName))
-                disconnect()
-            }
-        }
     }
 
     private suspend fun waitForSurface(): Surface {
