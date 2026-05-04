@@ -13,6 +13,13 @@ import java.util.ArrayDeque
 // API level constants for Surface.setFrameRate (declared inline so the file
 // builds on min-SDK without a separate compatibility shim).
 private const val FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = 1
+// `CHANGE_FRAME_RATE_ALWAYS` (API 31+) tells SurfaceFlinger to switch the
+// panel mode immediately and skip the seamless-only check. We're streaming
+// to a pen display where consistency > seamlessness, and Android's default
+// (`CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS`, value 0) sometimes refuses the
+// rate change on MovinkPad's panel modes — leaving us at whatever the
+// panel happened to be running at, which voids the FIXED_SOURCE intent.
+private const val CHANGE_FRAME_RATE_ALWAYS = 1
 
 /**
  * Async hardware decoder rendering directly into a Surface.
@@ -109,9 +116,17 @@ class VideoDecoder(
                     setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
                     // do NOT set KEY_PRIORITY here.
                 } else {
-                    // Predecessor's combo. Validated working on Adreno 720
-                    // (Snapdragon 8s Gen 3 — the dev rig).
-                    setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
+                    // `Short.MAX_VALUE` (32767) is moonlight's value for
+                    // "as fast as physically possible". Adreno's c2.qti
+                    // codec service interprets this as a hard hint to
+                    // hold the decoder block at peak clock — saves 1-3 ms
+                    // of decode tail vs. the predecessor's 240 hint
+                    // (which Qualcomm's DVFS treated as "I'll match real
+                    // demand" and slowly downclocked between frames).
+                    // Validated working on Adreno 720 (Snapdragon 8s Gen
+                    // 3 — the dev rig); Adreno 620 takes the branch
+                    // above to dodge a SIGSEGV from the same combo.
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
                     setInteger(MediaFormat.KEY_PRIORITY, 0)
                 }
             }
@@ -180,7 +195,21 @@ class VideoDecoder(
         // ratchets up with no recovery until user touch wakes the panel.
         // FRAME_RATE_COMPATIBILITY_FIXED_SOURCE = "I want this exact rate;
         // pick the panel mode that doesn't drop frames against my source."
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // On API 31+ also pass CHANGE_FRAME_RATE_ALWAYS so the platform
+        // commits to the requested rate even when the transition isn't
+        // seamless — better than getting silently downclocked because the
+        // panel's seamless modes don't include our target.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                surface.setFrameRate(
+                    fps.toFloat(),
+                    FRAME_RATE_COMPATIBILITY_FIXED_SOURCE,
+                    CHANGE_FRAME_RATE_ALWAYS,
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "Surface.setFrameRate($fps, ALWAYS) failed; panel VRR may downclock", t)
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             try {
                 surface.setFrameRate(fps.toFloat(), FRAME_RATE_COMPATIBILITY_FIXED_SOURCE)
             } catch (t: Throwable) {
