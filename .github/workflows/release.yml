@@ -131,8 +131,15 @@ jobs:
         # APK can't be installed via `adb install` on Android 14+.
         # Debug APKs install fine; the only practical difference is that
         # they're signed by the universal Android debug keystore.
+        #
+        # The chmod is defensive — gradlew should already have +x in git
+        # via `git update-index --chmod=+x`, but if a future contributor
+        # commits from Windows without core.fileMode set, this keeps the
+        # job working.
         working-directory: android
-        run: ./gradlew assembleDebug --console=plain
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --console=plain
 
       - name: Locate APK
         id: apk
