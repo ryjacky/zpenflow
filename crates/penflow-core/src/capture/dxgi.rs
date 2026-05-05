@@ -270,6 +270,7 @@ mod tests {
     /// timeout is generous (500 ms); CI runs may legitimately have a static
     /// desktop and time out, so a None result is also acceptable.
     #[test]
+    #[ignore = "requires real D3D11 hardware (DXGI Desktop Duplication); GitHub windows-latest VM has no GPU"]
     fn capture_one_frame() {
         let _g = crate::test_lock::DDA_LOCK.lock().unwrap();
         let factory = create_dxgi_factory().expect("factory");

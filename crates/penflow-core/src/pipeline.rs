@@ -347,6 +347,7 @@ mod tests {
     /// End-to-end: spin the pipeline against the desktop for a few hundred ms,
     /// expect at least a couple of packets and at least one keyframe.
     #[test]
+    #[ignore = "requires real D3D11 + NVENC pipeline; GitHub windows-latest VM has no GPU"]
     fn pipeline_emits_packets_and_keyframe() {
         let _g = crate::test_lock::DDA_LOCK.lock().unwrap();
         let factory = crate::d3d11::create_dxgi_factory().expect("factory");

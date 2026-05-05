@@ -807,6 +807,7 @@ mod tests {
     /// frames, expect at least one IDR packet back. Mirrors the gate-1 probe
     /// but goes through the production trait so we catch trait-shape bugs.
     #[test]
+    #[ignore = "requires real D3D11 + Media Foundation hardware encoder; GitHub windows-latest VM has no GPU"]
     fn session_emits_keyframe() {
         run_codec_smoke(Codec::Hevc);
     }
@@ -815,6 +816,7 @@ mod tests {
     /// codec dispatch in `pick_mft_for_adapter` / `configure_video_output_type`
     /// / `first_nal_is_idr` actually works on the dev rig's NVIDIA H.264 MFT.
     #[test]
+    #[ignore = "requires real D3D11 + Media Foundation hardware encoder; GitHub windows-latest VM has no GPU"]
     fn session_emits_keyframe_h264() {
         run_codec_smoke(Codec::H264);
     }

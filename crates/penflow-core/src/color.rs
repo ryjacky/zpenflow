@@ -309,6 +309,7 @@ mod tests {
     /// black BGRA frame into the cached NV12 texture. Verifies the API path
     /// compiles and the device supports the video pipeline.
     #[test]
+    #[ignore = "requires real D3D11 video device; GitHub windows-latest VM has no GPU"]
     fn converter_processes_one_frame() {
         let ctx = D3d11Context::create_high_perf().expect("d3d11 ctx");
         let conv = ColorConverter::new(&ctx, 256, 144, 60).expect("color converter");

@@ -294,6 +294,7 @@ impl EngineBuilder {
 mod tests {
     #[cfg(windows)]
     #[test]
+    #[ignore = "requires real D3D11 + NVENC; GitHub windows-latest VM has no GPU"]
     fn engine_round_trip() {
         use super::*;
         let _g = crate::test_lock::DDA_LOCK.lock().unwrap();

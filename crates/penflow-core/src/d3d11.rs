@@ -145,6 +145,7 @@ mod tests {
     /// Sanity test: on a normal Windows machine with at least one GPU, the
     /// high-perf factory call returns a usable D3D11 device.
     #[test]
+    #[ignore = "requires real D3D11 hardware; GitHub windows-latest VM has no GPU"]
     fn high_perf_context_creates() {
         let ctx = D3d11Context::create_high_perf().expect("D3D11 high-perf context");
         assert!(!ctx.adapter_name.is_empty(), "adapter name was empty");
