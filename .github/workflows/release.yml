@@ -1,10 +1,13 @@
 name: Release
 
-# Builds the Windows MSI and attaches it to a GitHub Release.
+# Builds the Windows MSI + Android APK and attaches them to a GitHub
+# Release. The MSI is the PC server / GUI; the APK is the Android client
+# that runs on the Wacom Movink Pad. Both are required for a working
+# install, so they ship together.
 #
 # Triggers:
 #   - Pushing a `v*` tag (e.g. `git tag v0.1.0 && git push --tags`)
-#     creates a draft release and uploads the MSI to it.
+#     creates a draft release and uploads both artefacts to it.
 #   - Manual dispatch from the Actions tab is supported for dry runs;
 #     the workflow then only uploads as a workflow artifact (no Release).
 
@@ -92,4 +95,74 @@ jobs:
           files: ${{ steps.msi.outputs.path }}
           draft: true
           generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  build-apk:
+    name: Build APK (ubuntu-latest)
+    runs-on: ubuntu-latest
+    # Run after build-msi so we don't race on creating the draft release;
+    # softprops/action-gh-release@v2 errors if two jobs both try to
+    # create-with-draft. With this dependency the MSI job creates the
+    # release and the APK job appends its file.
+    needs: build-msi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        # Android Gradle Plugin 8.5.2 + Kotlin 1.9.24 + jvmTarget=17 in
+        # android/app/build.gradle.
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: ${{ runner.os }}-gradle-
+
+      - name: Build debug APK
+        # We ship the debug-signed APK rather than release: there is no
+        # production signing key for Penflow yet, and an unsigned release
+        # APK can't be installed via `adb install` on Android 14+.
+        # Debug APKs install fine; the only practical difference is that
+        # they're signed by the universal Android debug keystore.
+        working-directory: android
+        run: ./gradlew assembleDebug --console=plain
+
+      - name: Locate APK
+        id: apk
+        run: |
+          src="android/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$src" || { echo "APK not found at $src"; exit 1; }
+          # Rename so the download filename communicates the version.
+          dst="penflow-android-${GITHUB_REF_NAME:-dev}-debug.apk"
+          cp "$src" "$dst"
+          size=$(stat -c%s "$dst")
+          echo "path=$dst"        >> "$GITHUB_OUTPUT"
+          echo "name=$dst"        >> "$GITHUB_OUTPUT"
+          echo "size=$size"       >> "$GITHUB_OUTPUT"
+          echo "Built $dst ($((size / 1024 / 1024)) MiB)"
+
+      - name: Upload APK as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach APK to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.apk.outputs.path }}
+          draft: true
+          # Don't regenerate notes — the MSI job already did. Setting
+          # this to false keeps softprops from clobbering them.
+          generate_release_notes: false
           fail_on_unmatched_files: true

@@ -249,7 +249,7 @@ Specifically:
 
 The Rust caller is at
 `crates/penflow-server/src/vdd.rs` in the
-[zpenflow](https://github.com/zhangyushaow/zpenflow) repo. Specifically
+[zpenflow](https://github.com/zhangyushao0/zpenflow) repo. Specifically
 `cm_enable()` + `verify_devnode_started()` + `wait_for_virtual_monitor()`.
 
 The full helper trace from one failing run is reproduced above. I can

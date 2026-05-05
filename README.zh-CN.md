@@ -4,8 +4,8 @@
 
 **通过一根 USB 线，把 Wacom Movink Pad Pro 14 变成真正的 Windows 数位屏 — 完整压感、倾斜、Windows Ink。**
 
-[![CI](https://github.com/zhangyushaow/zpenflow/actions/workflows/ci.yml/badge.svg)](https://github.com/zhangyushaow/zpenflow/actions/workflows/ci.yml)
-[![Release](https://github.com/zhangyushaow/zpenflow/actions/workflows/release.yml/badge.svg)](https://github.com/zhangyushaow/zpenflow/actions/workflows/release.yml)
+[![CI](https://github.com/zhangyushao0/zpenflow/actions/workflows/ci.yml/badge.svg)](https://github.com/zhangyushao0/zpenflow/actions/workflows/ci.yml)
+[![Release](https://github.com/zhangyushao0/zpenflow/actions/workflows/release.yml/badge.svg)](https://github.com/zhangyushao0/zpenflow/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#许可证)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-0078d4.svg)](#平台支持)
 
@@ -76,7 +76,7 @@ Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg
 | **开源** | ✅ MIT/Apache | ❌ |
 | **价格** | 免费 | 免费（beta） |
 
-> **关于上面的延迟和刷新率数字**：两组都是项目作者在同一台机器（Movink Pad Pro 14 + RTX 5070，USB 直连）上自己测的。Wacom 并未公布 Instant Pen Display Mode 的官方端到端延迟值，所以 60–70 ms 这个数字是**我们自己测的，不是厂商口径**。如果你测出来不一样，欢迎 [开 Issue](https://github.com/zhangyushaow/zpenflow/issues)，我们会更新表格。
+> **关于上面的延迟和刷新率数字**：两组都是项目作者在同一台机器（Movink Pad Pro 14 + RTX 5070，USB 直连）上自己测的。Wacom 并未公布 Instant Pen Display Mode 的官方端到端延迟值，所以 60–70 ms 这个数字是**我们自己测的，不是厂商口径**。如果你测出来不一样，欢迎 [开 Issue](https://github.com/zhangyushao0/zpenflow/issues)，我们会更新表格。
 
 ## 平台支持
 
@@ -104,11 +104,11 @@ Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg
 
 ## 快速安装 (Windows)
 
-1. 从 [Releases 页面](https://github.com/zhangyushaow/zpenflow/releases) 下载最新的 **Penflow_*.msi**。
+1. 从 [Releases 页面](https://github.com/zhangyushao0/zpenflow/releases) 下载最新的 **Penflow_*.msi**。
 2. 运行安装包。安装程序会把 Penflow 注册到程序列表，同时一并装好虚拟显示器驱动（一次 UAC 弹窗）。
 3. Movink Pad Pro 14 上：
    - 启用 **开发者选项** → **USB 调试**。
-   - 安装 [Penflow Android 客户端](https://github.com/zhangyushaow/zpenflow/releases) 的 APK（每个 release 也会附带）。
+   - 安装 [Penflow Android 客户端](https://github.com/zhangyushao0/zpenflow/releases) 的 APK（每个 release 也会附带）。
 4. USB 连接平板。在平板上同意 *允许此电脑进行 USB 调试*。
 5. 从开始菜单启动 **Penflow**。Android 端握手成功后，状态徽章会变成 *connected*。
 
@@ -126,7 +126,7 @@ Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg
 ### 完整构建
 
 ```powershell
-git clone https://github.com/zhangyushaow/zpenflow.git
+git clone https://github.com/zhangyushao0/zpenflow.git
 cd zpenflow
 
 # 一次性：从上游 release 下载 MttVDD + devcon.exe。

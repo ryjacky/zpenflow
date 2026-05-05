@@ -4,8 +4,8 @@
 
 **Turn your Wacom Movink Pad Pro 14 into a real Windows pen display — full pressure, tilt, and Windows Ink — over a USB cable.**
 
-[![CI](https://github.com/zhangyushaow/zpenflow/actions/workflows/ci.yml/badge.svg)](https://github.com/zhangyushaow/zpenflow/actions/workflows/ci.yml)
-[![Release](https://github.com/zhangyushaow/zpenflow/actions/workflows/release.yml/badge.svg)](https://github.com/zhangyushaow/zpenflow/actions/workflows/release.yml)
+[![CI](https://github.com/zhangyushao0/zpenflow/actions/workflows/ci.yml/badge.svg)](https://github.com/zhangyushao0/zpenflow/actions/workflows/ci.yml)
+[![Release](https://github.com/zhangyushao0/zpenflow/actions/workflows/release.yml/badge.svg)](https://github.com/zhangyushao0/zpenflow/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2B-0078d4.svg)](#platform-support)
 
@@ -76,7 +76,7 @@ The two PC-driving-the-Movink-Pad options today, side by side:
 | **Open source** | ✅ MIT/Apache | ❌ |
 | **Cost** | Free | Free (beta) |
 
-> **About the latency and refresh-rate numbers**: both are measured by the project author on the same rig (Movink Pad Pro 14 + RTX 5070, USB cable). Wacom does not publish an official pen-to-pixel latency for Instant Pen Display Mode, so the 60–70 ms figure is **our own measurement, not a vendor spec**. If your numbers come out different, please [open an issue](https://github.com/zhangyushaow/zpenflow/issues) — we'll update the table.
+> **About the latency and refresh-rate numbers**: both are measured by the project author on the same rig (Movink Pad Pro 14 + RTX 5070, USB cable). Wacom does not publish an official pen-to-pixel latency for Instant Pen Display Mode, so the 60–70 ms figure is **our own measurement, not a vendor spec**. If your numbers come out different, please [open an issue](https://github.com/zhangyushao0/zpenflow/issues) — we'll update the table.
 
 ## Platform support
 
@@ -104,11 +104,11 @@ The two PC-driving-the-Movink-Pad options today, side by side:
 
 ## Quick install (Windows)
 
-1. Download the latest **Penflow_*.msi** from the [Releases page](https://github.com/zhangyushaow/zpenflow/releases).
+1. Download the latest **Penflow_*.msi** from the [Releases page](https://github.com/zhangyushao0/zpenflow/releases).
 2. Run it. The installer registers Penflow under Programs and installs the Virtual Display Driver in one go (single UAC prompt).
 3. On your Movink Pad Pro 14:
    - Enable **Developer options** → **USB debugging**.
-   - Install the [Penflow Android client](https://github.com/zhangyushaow/zpenflow/releases) APK (also attached to each release).
+   - Install the [Penflow Android client](https://github.com/zhangyushao0/zpenflow/releases) APK (also attached to each release).
 4. Connect the tablet via USB. Approve the *Allow USB debugging from this computer* prompt on the tablet.
 5. Launch **Penflow** from the Start Menu. The status badge flips to *connected* once the Android app handshakes.
 
@@ -126,7 +126,7 @@ The two PC-driving-the-Movink-Pad options today, side by side:
 ### Build everything
 
 ```powershell
-git clone https://github.com/zhangyushaow/zpenflow.git
+git clone https://github.com/zhangyushao0/zpenflow.git
 cd zpenflow
 
 # One-time: download MttVDD + devcon.exe from the upstream release.
