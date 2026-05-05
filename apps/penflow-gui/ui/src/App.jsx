@@ -207,6 +207,8 @@ function statusBadge(state) {
     switch (state.state) {
         case "stopped":
             return { color: "warning", text: "paused" };
+        case "preparing":
+            return { color: "informative", text: "starting" };
         case "listening":
             return { color: "informative", text: "ready" };
         case "connecting":
@@ -225,6 +227,7 @@ function statusBadge(state) {
 function statusDescription(state) {
     switch (state.state) {
         case "stopped": return "Service paused";
+        case "preparing": return "Starting ADB daemon — first install can take 10–30 s";
         case "listening": return "Waiting for the Penflow Android app";
         case "connecting": return `Negotiating with ${state.peer}`;
         case "connected": return `${state.device_width}×${state.device_height}  ${state.peer}`;

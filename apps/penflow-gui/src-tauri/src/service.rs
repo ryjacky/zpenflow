@@ -32,6 +32,13 @@ use crate::settings::SharedSettings;
 pub enum ServiceState {
     /// Service is paused; no transport is open.
     Stopped,
+    /// Bringing up the ADB daemon and the reverse tunnel. On a fresh
+    /// install this can take 10–30s the first time — Windows Defender
+    /// scans adb.exe and the daemon initializes its keyring. We
+    /// surface this as its own state instead of jumping straight to
+    /// `Listening` so the user can tell the difference between
+    /// "ready to accept a tablet" and "still warming up".
+    Preparing,
     /// Service is running and waiting for an Android client to connect.
     Listening,
     /// Transport accepted a connection; handshake in progress.
@@ -135,13 +142,19 @@ impl Service {
                 return;
             }
 
-            self.emit(ServiceState::Listening).await;
-            eprintln!("[service] listening — calling adb reverse");
+            // Preparing → bind() does the slow work (start-server +
+            // reverse). We emit Listening only AFTER bind succeeds, so
+            // the UI label genuinely reflects "ready for a tablet to
+            // connect" rather than "we *would* be ready, but we're
+            // still waiting on adb.exe".
+            self.emit(ServiceState::Preparing).await;
+            eprintln!("[service] preparing — starting adb daemon + setting reverse rule");
 
             let transport: Arc<dyn Transport> =
                 match AdbLocalAbstractTransport::bind("penflow").await {
                     Ok(t) => {
                         eprintln!("[service] adb reverse OK; bound port={}", t.bound_port());
+                        self.emit(ServiceState::Listening).await;
                         Arc::new(t)
                     }
                     Err(e) => {

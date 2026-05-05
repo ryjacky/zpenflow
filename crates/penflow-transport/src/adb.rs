@@ -88,22 +88,57 @@ impl AdbLocalAbstractTransport {
         let adb_path: String = adb_path.into();
 
         // 1. Start the adb daemon (idempotent — `start-server` is a no-op
-        //    if one is already running).
-        run_adb(&adb_path, &["start-server"])?;
+        //    if one is already running). On a fresh install the very
+        //    first start-server invocation can take 10–30s while Windows
+        //    Defender scans adb.exe and the daemon initializes its
+        //    keyring; wrap in spawn_blocking so the tokio executor
+        //    thread isn't pinned. Without this wrap, every other async
+        //    task on that worker (Tauri command handlers, the event
+        //    pump, etc.) stalls until daemon startup completes — and
+        //    that's the most plausible explanation for the "first
+        //    launch can't connect to ADB" symptom users hit immediately
+        //    after MSI install.
+        {
+            let adb_path = adb_path.clone();
+            tokio::task::spawn_blocking(move || run_adb(&adb_path, &["start-server"]))
+                .await
+                .map_err(|e| io::Error::other(format!("spawn_blocking join: {e}")))??;
+        }
 
         // 2. Bind a TCP listener on a kernel-assigned port.
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let bound_port = listener.local_addr()?.port();
 
-        // 3. Set up the reverse tunnel.
-        run_adb(
-            &adb_path,
-            &[
-                "reverse",
-                &format!("localabstract:{abstract_name}"),
-                &format!("tcp:{bound_port}"),
-            ],
-        )?;
+        // 3. Set up the reverse tunnel. Also defensively remove any
+        //    stale rule from a prior crashed Penflow that didn't run
+        //    its Drop impl — that rule would point at a defunct TCP
+        //    port, and overwriting via plain `adb reverse` should be
+        //    fine in practice but let's be explicit.
+        {
+            let adb_path = adb_path.clone();
+            let abstract_name = abstract_name.clone();
+            tokio::task::spawn_blocking(move || {
+                // Best-effort: ignore errors (no rule present is fine).
+                let _ = run_adb(
+                    &adb_path,
+                    &[
+                        "reverse",
+                        "--remove",
+                        &format!("localabstract:{abstract_name}"),
+                    ],
+                );
+                run_adb(
+                    &adb_path,
+                    &[
+                        "reverse",
+                        &format!("localabstract:{abstract_name}"),
+                        &format!("tcp:{bound_port}"),
+                    ],
+                )
+            })
+            .await
+            .map_err(|e| io::Error::other(format!("spawn_blocking join: {e}")))??;
+        }
 
         Ok(Self {
             abstract_name,
