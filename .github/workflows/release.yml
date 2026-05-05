@@ -125,12 +125,17 @@ jobs:
           key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: ${{ runner.os }}-gradle-
 
-      - name: Build debug APK
+      - name: Build APK
         # We ship the debug-signed APK rather than release: there is no
-        # production signing key for Penflow yet, and an unsigned release
-        # APK can't be installed via `adb install` on Android 14+.
-        # Debug APKs install fine; the only practical difference is that
-        # they're signed by the universal Android debug keystore.
+        # production signing keystore for Penflow yet, and an unsigned
+        # release APK can't be installed via `adb install` on Android 14+
+        # (INSTALL_PARSE_FAILED_NO_CERTIFICATES). Debug builds install
+        # fine — they're signed by the universal Android debug keystore.
+        # With `minifyEnabled false` in app/build.gradle, debug and
+        # release APKs are otherwise byte-for-byte equivalent for our
+        # workload, so the practical difference is just the signature.
+        # When a real signing keystore + GitHub secrets exist, switch
+        # this step to assembleRelease + a signing config.
         #
         # The chmod is defensive — gradlew should already have +x in git
         # via `git update-index --chmod=+x`, but if a future contributor
@@ -147,7 +152,12 @@ jobs:
           src="android/app/build/outputs/apk/debug/app-debug.apk"
           test -f "$src" || { echo "APK not found at $src"; exit 1; }
           # Rename so the download filename communicates the version.
-          dst="penflow-android-${GITHUB_REF_NAME:-dev}-debug.apk"
+          # We drop the "-debug" suffix on the public-facing artefact
+          # because the only practical difference vs a release APK is
+          # the signing keystore (see comment on the Build step), and
+          # the suffix would just confuse users into thinking they're
+          # downloading an unfinished build.
+          dst="penflow-android-${GITHUB_REF_NAME:-dev}.apk"
           cp "$src" "$dst"
           size=$(stat -c%s "$dst")
           echo "path=$dst"        >> "$GITHUB_OUTPUT"
