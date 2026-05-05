@@ -216,13 +216,14 @@ impl Service {
             tokio::select! {
                 r = session_run => match r {
                     Ok(()) => {
+                        eprintln!("[service] session ended cleanly (Disconnected)");
                         self.emit(ServiceState::Disconnected).await;
                     }
                     Err(e) => {
-                        self.emit(ServiceState::Error {
-                            message: format!("session: {e}"),
-                        })
-                        .await;
+                        let msg = format!("session: {e}");
+                        eprintln!("[service] {msg}");
+                        log_diagnostic(&msg);
+                        self.emit(ServiceState::Error { message: msg }).await;
                     }
                 },
                 _ = &mut cancel => {

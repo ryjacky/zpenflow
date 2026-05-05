@@ -24,14 +24,26 @@
     target is live. devcon is Microsoft-signed and bundled by the
     upstream VDD release; we ship it next to the .inf at vdd/devcon.exe.
 
-  Why devcon disable right after install:
+  Why we DON'T disable right after install:
     The IDDCx driver, on `devcon install`, comes up enabled by default
     — meaning Windows immediately allocates a virtual monitor and
-    starts a spinner-backed display target. Penflow's design is to
-    keep the device disabled at rest and only enable it for the
-    duration of an active session (see crates/penflow-server/src/vdd.rs
-    `enable()` / `disable()`). Disabling right after install gets us
-    to that resting state in one shot.
+    starts a spinner-backed display target. We tried adding a
+    `devcon disable Root\MttVDD` step to land the device in the
+    "off at rest" state Penflow's session lifecycle assumes — but
+    `devcon disable` writes the registry `ConfigFlags =
+    CONFIGFLAG_DISABLED (0x1)`, which subsequent CM_Enable_DevNode
+    calls (Penflow's elevation-light enable path) cannot clear.
+    The first Penflow session after a fresh MSI then booted with
+    status=0x01802401 problem=0x16 forever, DisplayConfig topology
+    extension kept failing with ERROR_INVALID_PARAMETER (87), and
+    DXGI never enumerated a virtual monitor.
+
+    Resting state is now achieved by Penflow's own session-end
+    `disable()` (which calls CM_Disable_DevNode, no registry flag),
+    so after the first enable→disable cycle the device sits idle
+    correctly. The narrow window of "enabled at rest but no session
+    yet" only spans MSI-install → first GUI launch, which in
+    practice is seconds.
 
   Uninstall:
     On REMOVE=ALL, run `devcon remove Root\MttVDD` BEFORE Tauri's
@@ -78,12 +90,14 @@
             Impersonate="no"
             Return="ignore" />
 
-        <!-- Disable the just-installed device. Penflow flips it back on
-             per-session. -->
+        <!-- Defensive: if a prior Penflow install left the device with
+             registry-persisted CONFIGFLAG_DISABLED, clear it now.
+             devcon enable is a no-op when the device is already
+             enabled, so this is safe to run unconditionally. -->
         <CustomAction
-            Id="PenflowDisableVdd"
+            Id="PenflowEnableVdd"
             Directory="INSTALLDIR"
-            ExeCommand='"[INSTALLDIR]vdd\devcon.exe" disable "Root\MttVDD"'
+            ExeCommand='"[INSTALLDIR]vdd\devcon.exe" enable "Root\MttVDD"'
             Execute="deferred"
             Impersonate="no"
             Return="ignore" />
@@ -113,12 +127,13 @@
 
         <InstallExecuteSequence>
             <!-- Install side: only on a true install, not uninstall.
-                 InstallVdd → DisableVdd → ApplyVddSettings, in that
-                 order, all After="InstallFiles" so [INSTALLDIR]\vdd\
-                 is populated. -->
+                 InstallVdd → EnableVdd (clear stale registry-disabled
+                 flag from any prior install) → ApplyVddSettings, in
+                 that order, all After="InstallFiles" so
+                 [INSTALLDIR]\vdd\ is populated. -->
             <Custom Action="PenflowInstallVdd"        After="InstallFiles">NOT REMOVE~="ALL"</Custom>
-            <Custom Action="PenflowDisableVdd"        After="PenflowInstallVdd">NOT REMOVE~="ALL"</Custom>
-            <Custom Action="PenflowApplyVddSettings"  After="PenflowDisableVdd">NOT REMOVE~="ALL"</Custom>
+            <Custom Action="PenflowEnableVdd"         After="PenflowInstallVdd">NOT REMOVE~="ALL"</Custom>
+            <Custom Action="PenflowApplyVddSettings"  After="PenflowEnableVdd">NOT REMOVE~="ALL"</Custom>
 
             <!-- Uninstall side: only on a true uninstall (not on
                  upgrade/repair). Run BEFORE the standard RemoveFiles
