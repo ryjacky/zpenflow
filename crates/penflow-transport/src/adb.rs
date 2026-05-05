@@ -85,7 +85,15 @@ impl AdbLocalAbstractTransport {
         adb_path: impl Into<String>,
     ) -> io::Result<Self> {
         let abstract_name = abstract_name.into();
-        let adb_path: String = adb_path.into();
+        // Resolve scoop-style shims to their underlying executable. See
+        // [`resolve_through_shim`] for the why; tl;dr: scoop's shimexe
+        // wrapper falls back to console-mode handle inheritance when it
+        // can't determine the target's subsystem, and a windows_subsystem
+        // = "windows" parent (Penflow's release build) has no console
+        // for it to inherit, which makes CreateProcess fail with
+        // "Could not create process". Going straight to the underlying
+        // adb.exe sidesteps the entire shim.
+        let adb_path: String = resolve_through_shim(&adb_path.into());
 
         // 1. Start the adb daemon (idempotent — `start-server` is a no-op
         //    if one is already running). On a fresh install the very
@@ -240,6 +248,77 @@ impl Drop for AdbLocalAbstractTransport {
     }
 }
 
+/// Resolve a `Command::new(name)` style target through scoop's shim layer.
+///
+/// scoop installs binaries under `~/scoop/apps/<name>/current/...` and
+/// puts thin trampoline `name.exe` wrappers in `~/scoop/shims/`. Each
+/// trampoline reads a sibling `name.shim` text file containing the real
+/// target path, then `CreateProcessW`s it. The trampoline runs a PE
+/// header peek to decide GUI-vs-console handle wiring; on failure it
+/// logs `"Could not determine if target is a GUI app. Assuming console."`
+/// and tries to inherit the parent's console handles. A
+/// `windows_subsystem = "windows"` parent (Penflow's release build)
+/// has no console, the inheritance call returns invalid, and the whole
+/// CreateProcess fails with `"Could not create process"`.
+///
+/// Workaround: when we detect a `.shim` file next to the resolved
+/// path, parse the `path = "..."` line out of it and use that
+/// directly. The real adb.exe doesn't need a console.
+///
+/// On non-Windows platforms this is a no-op pass-through.
+#[cfg(windows)]
+fn resolve_through_shim(cmd: &str) -> String {
+    // Step 1: turn `cmd` into an absolute path on disk, by walking PATH
+    // if it's a bare name. Mirrors how `Command::new(cmd).spawn()`
+    // would search.
+    let candidate: std::path::PathBuf = if cmd.contains('\\') || cmd.contains('/') {
+        std::path::PathBuf::from(cmd)
+    } else {
+        let Some(path_var) = std::env::var_os("PATH") else {
+            return cmd.to_string();
+        };
+        let mut found: Option<std::path::PathBuf> = None;
+        'outer: for dir in std::env::split_paths(&path_var) {
+            for ext in ["", ".exe", ".bat", ".cmd"] {
+                let probe = dir.join(format!("{cmd}{ext}"));
+                if probe.is_file() {
+                    found = Some(probe);
+                    break 'outer;
+                }
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => return cmd.to_string(), // let Command::new error naturally
+        }
+    };
+
+    // Step 2: if a sibling `.shim` exists (scoop convention), parse
+    // `path = "..."` out of it and prefer that over the trampoline.
+    let shim = candidate.with_extension("shim");
+    if shim.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&shim) {
+            for line in content.lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("path") {
+                    let after_eq = rest.trim_start().strip_prefix('=').unwrap_or("").trim();
+                    let unquoted = after_eq.trim_matches('"');
+                    if !unquoted.is_empty() && std::path::Path::new(unquoted).is_file() {
+                        return unquoted.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    candidate.to_string_lossy().into_owned()
+}
+
+#[cfg(not(windows))]
+fn resolve_through_shim(cmd: &str) -> String {
+    cmd.to_string()
+}
+
 fn run_adb(adb_path: &str, args: &[&str]) -> io::Result<Output> {
     let mut cmd = Command::new(adb_path);
     cmd.args(args)
@@ -271,4 +350,52 @@ fn run_adb(adb_path: &str, args: &[&str]) -> io::Result<Output> {
         )));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod resolve_through_shim_tests {
+    use super::resolve_through_shim;
+
+    /// On non-Windows targets the function is a pass-through and the
+    /// scoop-style shim parsing isn't compiled, so most of the body
+    /// can't be exercised; smoke-test that the input is returned as-is.
+    #[cfg(not(windows))]
+    #[test]
+    fn pass_through_on_unix() {
+        assert_eq!(resolve_through_shim("adb"), "adb");
+    }
+
+    /// Windows: build a fake `~/scoop/shims/`-style layout in tempdir,
+    /// drop a `foo.exe` trampoline + `foo.shim` config, point PATH at
+    /// it, and verify resolve picks the path inside the .shim.
+    #[cfg(windows)]
+    #[test]
+    fn parses_scoop_shim_config() {
+        let tmp = std::env::temp_dir().join(format!("penflow-shim-test-{}", std::process::id()));
+        let shims = tmp.join("shims");
+        let real_dir = tmp.join("real");
+        std::fs::create_dir_all(&shims).unwrap();
+        std::fs::create_dir_all(&real_dir).unwrap();
+
+        let trampoline = shims.join("foo.exe");
+        let shim_cfg = shims.join("foo.shim");
+        let real_target = real_dir.join("foo.exe");
+        std::fs::write(&trampoline, b"trampoline-bytes").unwrap();
+        std::fs::write(&real_target, b"real-bytes").unwrap();
+        std::fs::write(&shim_cfg, format!("path = \"{}\"\n", real_target.display())).unwrap();
+
+        // Save + override PATH for the duration of the test.
+        let saved_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", shims.as_os_str());
+
+        let resolved = resolve_through_shim("foo");
+        // Restore PATH BEFORE asserting so a panic doesn't leak.
+        match saved_path {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(resolved, real_target.to_string_lossy());
+    }
 }
