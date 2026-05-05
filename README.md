@@ -21,9 +21,9 @@ Penflow streams your Windows desktop to a **Wacom Movink Pad Pro 14** over USB a
 
 Penflow is a free, open-source replacement for **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg/how-to-use-instant-pen-display-mode-movinkpad-tablet/)** — Wacom's own (currently beta, MovinkPad-exclusive) PC connection app. Compared with Wacom's first-party path, Penflow:
 
-- Drives a **120 Hz virtual extended display** (via a bundled VDD) instead of a 60 Hz mirror of your primary monitor — your physical screen isn't pinned to the tablet's resolution, and the pipeline runs at 2× Wacom's frame rate end-to-end.
+- Drives a **120 Hz virtual display sized to the tablet's exact 2880×1800 panel** — so pixels are 1:1 native and there are **no black bars on top and bottom** (Wacom IPD letterboxes in both mirror and extend modes because it streams whatever your source monitor is). The pipeline runs at 2× Wacom's 60 Hz end-to-end.
 - Cuts pen-to-pixel latency from a measured **~60–70 ms** on Wacom's app to **~26 ms** on Penflow on the same rig.
-- Exposes **all three Pro Pen 3 side switches** with fully customizable per-button bindings (Tap key / Hold key / Mouse button / Eraser toggle), instead of Wacom's fixed presets.
+- Exposes **all three Pro Pen 3 side switches** with fully customizable per-button bindings (Tap key / Hold key / Mouse button / Eraser toggle). Wacom's PC mode doesn't surface the side switches to Windows at all.
 - Is **open source** and configurable down to the wire format.
 
 > **Status**: pre-v1.0, actively developed. Currently Windows-only; macOS host support is on the [roadmap](#roadmap).
@@ -68,8 +68,8 @@ The two PC-driving-the-Movink-Pad options today, side by side:
 |---|:---:|:---:|
 | **Direction** | PC → tablet | PC → tablet |
 | **Pen pressure / tilt** | ✅ Windows Ink | ✅ Windows Ink |
-| **All 3 Pro Pen 3 buttons, configurable** | ✅ | preset only |
-| **Extended display (not mirror)** | ✅ via VDD | ❌ mirror only |
+| **3 Pro Pen 3 side buttons** | ✅ all three, configurable | ❌ not exposed in IPD mode |
+| **Native 1:1 panel resolution (no letterboxing)** | ✅ (VDD sized to 2880×1800) | ❌ letterboxed in both mirror and extend modes |
 | **Refresh rate** | **120 Hz** | 60 Hz |
 | **Latency (wired)** | **~26 ms** | ~60–70 ms |
 | **Transport** | USB (ADB) | USB or Wi-Fi |
