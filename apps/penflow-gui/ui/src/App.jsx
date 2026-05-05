@@ -595,6 +595,15 @@ export default function App() {
                                 onChange={(_, d) => setSettings({ ...settings, run_as_admin: d.checked })}
                             />
                         </div>
+                        <div className={styles.row}>
+                            <span className={styles.rowLabel} title="Show the latency HUD overlay on the tablet. Takes effect after the next reconnect.">
+                                Show tablet HUD overlay
+                            </span>
+                            <Switch
+                                checked={settings.hud_enabled !== false}
+                                onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
+                            />
+                        </div>
                         <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
                             {elevated ? "Currently running as administrator" : "Currently running unelevated"}
                         </Caption1>

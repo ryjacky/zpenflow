@@ -38,6 +38,15 @@ pub struct Settings {
     /// elevated injectors.
     #[serde(default)]
     pub run_as_admin: bool,
+    /// Show the latency HUD overlay on the Android client. Default on.
+    /// Toggling this requires the Android client to reconnect — the
+    /// flag is sent during the session's `MSG_CLIENT_CONFIG` handshake.
+    #[serde(default = "default_hud_enabled")]
+    pub hud_enabled: bool,
+}
+
+fn default_hud_enabled() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -49,6 +58,7 @@ impl Default for Settings {
             bindings: PenBindings::default(),
             autostart: false,
             run_as_admin: false,
+            hud_enabled: default_hud_enabled(),
         }
     }
 }

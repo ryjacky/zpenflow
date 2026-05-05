@@ -19,7 +19,11 @@ object Protocol {
     const val MSG_BRUSH_HINT: Byte = 0x04
     const val MSG_TELEMETRY: Byte = 0x05
     const val MSG_TIME_SYNC_RESP: Byte = 0x06
+    const val MSG_CLIENT_CONFIG: Byte = 0x07
     const val MSG_PC_GOODBYE: Byte = 0x7F
+
+    // Bits in CLIENT_CONFIG.flags
+    const val CLIENT_CFG_FLAG_HUD = 1 shl 0
 
     // Android -> PC
     const val MSG_HELLO_ANDROID: Byte = 0x81.toByte()
@@ -101,6 +105,19 @@ object Protocol {
             bitrate = buf.int,
             fps = buf.get().toInt() and 0xFF
         )
+    }
+
+    /** Decoded MSG_CLIENT_CONFIG payload (server-issued client preferences). */
+    data class ClientConfig(val flags: Int) {
+        val hudEnabled: Boolean get() = (flags and CLIENT_CFG_FLAG_HUD) != 0
+    }
+
+    /** Lenient: accepts any payload >= 4 bytes; ignores trailing bytes so a
+     *  newer server with extra fields keeps talking to this client. */
+    fun decodeClientConfig(payload: ByteArray): ClientConfig {
+        require(payload.size >= 4) { "CLIENT_CONFIG length ${payload.size} < 4" }
+        val buf = ByteBuffer.wrap(payload, 0, 4).order(ByteOrder.BIG_ENDIAN)
+        return ClientConfig(flags = buf.int)
     }
 
     /** Decoded MSG_VIDEO_FRAME header + coded payload. */

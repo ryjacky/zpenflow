@@ -91,6 +91,18 @@ class MainActivity : Activity() {
             onState = { st -> runOnUiThread { renderState(st) } },
             surfaceProvider = { currentSurface },
             hud = hud,
+            onClientConfig = { cfg ->
+                runOnUiThread {
+                    val vis = if (cfg.hudEnabled) android.view.View.VISIBLE
+                              else android.view.View.GONE
+                    // The HUD toggle hides BOTH overlays the user sees on the
+                    // tablet: the right-side latency panel (HudView) and the
+                    // top-left status / resolution readout. They're separate
+                    // Views but conceptually one "instrumentation overlay".
+                    hud.visibility = vis
+                    statusView.visibility = vis
+                }
+            },
         )
     }
 

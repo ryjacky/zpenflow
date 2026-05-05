@@ -279,6 +279,7 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         motion_idr_threshold_bytes: None,
         motion_idr_min_interval: Duration::from_millis(250),
         vdd,
+        hud_enabled: s.hud_enabled,
     }
 }
 

@@ -174,6 +174,7 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         motion_idr_threshold_bytes: None,
         motion_idr_min_interval: Duration::from_millis(250),
         vdd,
+        hud_enabled: true,
     };
 
     // Subscribe to lifecycle events so the operator sees them.

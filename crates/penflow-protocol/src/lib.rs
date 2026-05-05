@@ -29,6 +29,11 @@ pub const MSG_BRUSH_HINT: u8 = 0x04;
 pub const MSG_TELEMETRY: u8 = 0x05;
 /// Server → client: NTP-style time-sync response.
 pub const MSG_TIME_SYNC_RESP: u8 = 0x06;
+/// Server → client: client-side display preferences (HUD on/off, etc).
+/// Sent once right after `MSG_HELLO_PC`. Older clients that don't
+/// recognise the id silently skip the frame thanks to the length-prefix
+/// framing — adding new client preferences here is forward-compatible.
+pub const MSG_CLIENT_CONFIG: u8 = 0x07;
 /// Server → client: clean shutdown notice.
 pub const MSG_PC_GOODBYE: u8 = 0x7F;
 
@@ -261,6 +266,52 @@ impl HelloAndroid {
             pen_buttons_count: payload[11],
             codec_caps: payload[12],
         })
+    }
+}
+
+/// Server → client preference flags. Bit 0 = HUD overlay enabled.
+/// New flag bits MUST be additive (default-off), so an older client
+/// that ignores them keeps working.
+pub const CLIENT_CFG_FLAG_HUD: u32 = 1 << 0;
+
+/// `MSG_CLIENT_CONFIG` payload. Currently a single u32 of preference
+/// flags. Kept fixed-width so future fields can be appended after it
+/// while old clients (which check `payload.len() == SIZE` strictly) can
+/// be made permissive by checking `payload.len() >= SIZE` instead — see
+/// `decode_lenient`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClientConfig {
+    /// Bitmask of `CLIENT_CFG_FLAG_*`.
+    pub flags: u32,
+}
+
+impl ClientConfig {
+    /// Wire size in bytes.
+    pub const SIZE: usize = 4;
+
+    /// Encode to bytes.
+    pub fn encode(&self) -> Vec<u8> {
+        self.flags.to_be_bytes().to_vec()
+    }
+
+    /// Decode the payload of a `MSG_CLIENT_CONFIG` frame. Lenient — any
+    /// trailing bytes (future-version fields) are ignored, so v1 servers
+    /// can talk to v0 clients too.
+    pub fn decode(payload: &[u8]) -> Result<Self, ProtocolError> {
+        if payload.len() < Self::SIZE {
+            return Err(ProtocolError::Malformed {
+                msg: MSG_CLIENT_CONFIG,
+                detail: "CLIENT_CONFIG must be at least 4 bytes",
+            });
+        }
+        Ok(Self {
+            flags: u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]),
+        })
+    }
+
+    /// Convenience: is HUD bit set?
+    pub fn hud_enabled(&self) -> bool {
+        self.flags & CLIENT_CFG_FLAG_HUD != 0
     }
 }
 
@@ -695,6 +746,29 @@ mod tests {
         assert_eq!(raw[0], MSG_VIDEO_FRAME);
         assert_eq!(raw[1..5], 5u32.to_be_bytes());
         assert_eq!(&raw[5..], b"hello");
+    }
+
+    #[test]
+    fn client_config_round_trip() {
+        let c = ClientConfig {
+            flags: CLIENT_CFG_FLAG_HUD,
+        };
+        let bytes = c.encode();
+        assert_eq!(bytes.len(), ClientConfig::SIZE);
+        let back = ClientConfig::decode(&bytes).unwrap();
+        assert_eq!(back, c);
+        assert!(back.hud_enabled());
+    }
+
+    #[test]
+    fn client_config_decode_is_lenient_to_trailing_bytes() {
+        let mut bytes = ClientConfig {
+            flags: CLIENT_CFG_FLAG_HUD,
+        }
+        .encode();
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]); // future fields
+        let back = ClientConfig::decode(&bytes).unwrap();
+        assert!(back.hud_enabled());
     }
 
     #[tokio::test]

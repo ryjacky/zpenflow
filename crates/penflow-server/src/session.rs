@@ -33,11 +33,12 @@ use penflow_core::inject::{PenSample, TouchPoint, TouchState};
 use penflow_core::monitors::MonitorInfo;
 use penflow_core::Engine;
 use penflow_protocol::{
-    encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, HelloAndroid,
-    HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame, CODEC_H264,
-    CODEC_HEVC, FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_HELLO_ANDROID,
-    MSG_HELLO_PC, MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ,
-    MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
+    encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, ClientConfig,
+    HelloAndroid, HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame,
+    CLIENT_CFG_FLAG_HUD, CODEC_H264, CODEC_HEVC, FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME,
+    MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG, MSG_HELLO_ANDROID, MSG_HELLO_PC, MSG_PC_GOODBYE,
+    MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP,
+    MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
 };
 use penflow_transport::{Transport, TransportStream};
 
@@ -129,6 +130,9 @@ pub struct SessionConfig {
     /// `disable()` is called to remove the virtual monitor from idle
     /// desktop. Discovered by `VddController::detect()` at process startup.
     pub vdd: Option<VddController>,
+    /// Whether the Android HUD overlay should be enabled. Forwarded to
+    /// the client via `MSG_CLIENT_CONFIG` immediately after the handshake.
+    pub hud_enabled: bool,
 }
 
 impl Default for SessionConfig {
@@ -178,6 +182,7 @@ impl Default for SessionConfig {
             motion_idr_threshold_bytes: None,
             motion_idr_min_interval: Duration::from_millis(250),
             vdd: None,
+            hud_enabled: true,
         }
     }
 }
@@ -440,6 +445,20 @@ impl Session {
             fps: self.cfg.fps.min(255) as u8,
         };
         write_frame(&mut writer, MSG_HELLO_PC, &hello_pc.encode()).await?;
+
+        // CLIENT_CONFIG ships right after HELLO_PC. The wire id 0x07 was
+        // unused in v0 clients, so any older client gracefully skips it
+        // (read_frame returns Ok and the dispatch loop's `_` arm drops
+        // unknown ids). New clients toggle the HUD based on bit 0.
+        let client_cfg = ClientConfig {
+            flags: if self.cfg.hud_enabled {
+                CLIENT_CFG_FLAG_HUD
+            } else {
+                0
+            },
+        };
+        write_frame(&mut writer, MSG_CLIENT_CONFIG, &client_cfg.encode()).await?;
+
         write_frame(&mut writer, MSG_VIDEO_CONFIG, &csd0).await?;
         let first_vf = VideoFrame {
             pts_ns: first_pkt.pts_ns,

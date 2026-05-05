@@ -28,6 +28,9 @@ class PenflowClient(
     private val onState: (State) -> Unit,
     private val surfaceProvider: () -> Surface?,
     private val hud: HudView? = null,
+    /** Called from the network thread when the server sends MSG_CLIENT_CONFIG.
+     *  Implementations should marshal to the UI thread before touching views. */
+    private val onClientConfig: ((Protocol.ClientConfig) -> Unit)? = null,
 ) {
 
     sealed class State {
@@ -196,14 +199,29 @@ class PenflowClient(
                 val hello = Protocol.decodeHelloPc(helloPayload)
                 Log.i(TAG, "HELLO_PC ${hello.width}x${hello.height}@${hello.fps} codec=${hello.codec}")
 
-                // 3. wait for VIDEO_CONFIG (csd-0)
+                // 3. wait for VIDEO_CONFIG (csd-0). The server may interleave
+                //    other one-shot messages here — currently CLIENT_CONFIG —
+                //    so handle the known ones inline and only warn for truly
+                //    unexpected ids.
                 var csd0: ByteArray? = null
                 while (csd0 == null) {
                     val (type, payload) = Protocol.recvMsg(input)
-                    if (type == Protocol.MSG_VIDEO_CONFIG) {
-                        csd0 = payload
-                    } else {
-                        Log.w(TAG, "expected VIDEO_CONFIG, got 0x${"%02x".format(type.toInt() and 0xFF)}; dropping")
+                    when (type) {
+                        Protocol.MSG_VIDEO_CONFIG -> {
+                            csd0 = payload
+                        }
+                        Protocol.MSG_CLIENT_CONFIG -> {
+                            try {
+                                val cfg = Protocol.decodeClientConfig(payload)
+                                Log.i(TAG, "CLIENT_CONFIG (handshake) flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled}")
+                                onClientConfig?.invoke(cfg)
+                            } catch (e: Exception) {
+                                Log.w(TAG, "CLIENT_CONFIG decode failed: $e (ignoring)")
+                            }
+                        }
+                        else -> {
+                            Log.w(TAG, "expected VIDEO_CONFIG, got 0x${"%02x".format(type.toInt() and 0xFF)}; dropping")
+                        }
                     }
                 }
 
@@ -278,6 +296,15 @@ class PenflowClient(
                 }
                 Protocol.MSG_TELEMETRY -> {
                     hud?.recordServerTelemetry(Protocol.decodeTelemetry(payload))
+                }
+                Protocol.MSG_CLIENT_CONFIG -> {
+                    try {
+                        val cfg = Protocol.decodeClientConfig(payload)
+                        Log.i(TAG, "CLIENT_CONFIG flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled}")
+                        onClientConfig?.invoke(cfg)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "CLIENT_CONFIG decode failed: $e (ignoring)")
+                    }
                 }
                 Protocol.MSG_TIME_SYNC_RESP -> {
                     val t4 = System.nanoTime()
