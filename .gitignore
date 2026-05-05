@@ -19,6 +19,7 @@ android/.idea/
 # Editor / OS
 .vscode/
 .idea/
+.claude/
 Thumbs.db
 .DS_Store
 
@@ -31,6 +32,11 @@ tools/vdd/*.dll
 tools/vdd/*.exe
 tools/vdd/VDD.Control*
 tools/vdd/VirtualDriverControl*
+
+# Bundled adb (download from Google; not for VCS — fetch-adb.ps1 stages it)
+installer/adb/
+installer/.cache/
+installer/vdd-driver/
 
 # Stray MSI bundle artifacts that occasionally land at the repo root
 # (e.g. a manual `dark.exe` decompile of an MSI for debugging).

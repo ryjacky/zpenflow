@@ -59,6 +59,15 @@ jobs:
         shell: pwsh
         run: ./installer/fetch-vdd.ps1
 
+      - name: Stage bundled adb.exe
+        # The MSI bundles adb.exe + the two AdbWin*Api DLLs under
+        # [INSTALLDIR]\adb\ so Penflow runs against its own private
+        # platform-tools instead of whatever the user has on PATH.
+        # Avoids scoop-shim CreateProcess failures and partial
+        # Android Studio installs.
+        shell: pwsh
+        run: ./installer/fetch-adb.ps1
+
       - name: Build MSI bundle
         working-directory: apps/penflow-gui
         run: cargo tauri build --bundles msi

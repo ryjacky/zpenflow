@@ -148,10 +148,11 @@ impl Service {
             // connect" rather than "we *would* be ready, but we're
             // still waiting on adb.exe".
             self.emit(ServiceState::Preparing).await;
-            eprintln!("[service] preparing — starting adb daemon + setting reverse rule");
+            let adb_path = bundled_or_path_adb();
+            eprintln!("[service] preparing — adb at '{adb_path}'");
 
             let transport: Arc<dyn Transport> =
-                match AdbLocalAbstractTransport::bind("penflow").await {
+                match AdbLocalAbstractTransport::bind_with_adb("penflow", adb_path).await {
                     Ok(t) => {
                         eprintln!("[service] adb reverse OK; bound port={}", t.bound_port());
                         self.emit(ServiceState::Listening).await;
@@ -265,6 +266,32 @@ fn translate_event(ev: SessionEvent) -> ServiceState {
         SessionEvent::Disconnected => ServiceState::Disconnected,
         SessionEvent::Errored(e) => ServiceState::Error { message: e },
     }
+}
+
+/// Find the adb executable to use for this session.
+///
+/// Preference order:
+///   1. **Bundled adb** at `<exe-dir>/adb/adb.exe`. The MSI installer
+///      drops a private adb.exe + the two AdbWin*Api DLLs into the
+///      Penflow install folder so the user doesn't need adb anywhere
+///      on PATH. This is the reliable path that doesn't depend on
+///      whatever the user's local Android tooling looks like.
+///   2. **`adb` on PATH** as a fallback. Only hit when running against
+///      `cargo tauri dev` from a checkout (where the bundled adb
+///      isn't laid out next to the dev binary), or when the user
+///      manually deleted Penflow's adb folder. The transport crate's
+///      `resolve_through_shim` then handles scoop-style indirection
+///      if applicable.
+fn bundled_or_path_adb() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("adb").join("adb.exe");
+            if bundled.is_file() {
+                return bundled.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "adb".to_string()
 }
 
 /// Append a diagnostic line to %APPDATA%/Penflow/debug.log. Best-effort —

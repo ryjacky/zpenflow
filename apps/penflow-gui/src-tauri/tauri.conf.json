@@ -46,7 +46,10 @@
             "../../../installer/vdd-driver/MttVDD.dll":  "vdd/MttVDD.dll",
             "../../../installer/vdd-driver/mttvdd.cat":  "vdd/mttvdd.cat",
             "../../../installer/vdd-driver/devcon.exe":  "vdd/devcon.exe",
-            "../../../tools/vdd/vdd_settings.xml":       "vdd/vdd_settings.xml"
+            "../../../tools/vdd/vdd_settings.xml":       "vdd/vdd_settings.xml",
+            "../../../installer/adb/adb.exe":            "adb/adb.exe",
+            "../../../installer/adb/AdbWinApi.dll":      "adb/AdbWinApi.dll",
+            "../../../installer/adb/AdbWinUsbApi.dll":   "adb/AdbWinUsbApi.dll"
         },
         "windows": {
             "wix": {
