@@ -242,7 +242,16 @@ impl Drop for AdbLocalAbstractTransport {
 
 fn run_adb(adb_path: &str, args: &[&str]) -> io::Result<Output> {
     let mut cmd = Command::new(adb_path);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        // Penflow's GUI binary has windows_subsystem="windows" in release,
+        // so the parent process has NO console — and therefore NO valid
+        // stdin handle. Some shim wrappers (notably scoop's shimexe) try
+        // to inherit and validate the parent's stdin and fail with
+        // "Shim: Could not start the executable" when it's invalid.
+        // Explicitly null stdin to give the child a well-defined handle.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let out = silent(&mut cmd).output().map_err(|e| {
         io::Error::new(
             e.kind(),

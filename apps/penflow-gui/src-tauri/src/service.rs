@@ -158,7 +158,16 @@ impl Service {
                         Arc::new(t)
                     }
                     Err(e) => {
-                        eprintln!("[service] adb reverse failed: {e}");
+                        let full = format!("adb reverse failed: {e}");
+                        eprintln!("[service] {full}");
+                        // Also append to a debug log under %APPDATA% so the
+                        // FULL stderr survives release builds (where the
+                        // GUI has no console attached) and survives the
+                        // UI's truncation of the error badge — which only
+                        // shows the first ~80 chars and clips real
+                        // diagnostic detail like "Shim: Could not start
+                        // the executable" with an ellipsis.
+                        log_diagnostic(&full);
                         // "adb not on PATH" can never be fixed by retrying —
                         // back off hard so we're not respawning adb 30× a
                         // minute and (pre-CREATE_NO_WINDOW fix) flashing
@@ -172,10 +181,7 @@ impl Service {
                         } else {
                             Duration::from_secs(5)
                         };
-                        self.emit(ServiceState::Error {
-                            message: format!("adb reverse failed: {e}"),
-                        })
-                        .await;
+                        self.emit(ServiceState::Error { message: full }).await;
                         tokio::select! {
                             _ = tokio::time::sleep(backoff) => continue,
                             _ = &mut cancel => return,
@@ -259,6 +265,33 @@ fn translate_event(ev: SessionEvent) -> ServiceState {
         SessionEvent::Disconnected => ServiceState::Disconnected,
         SessionEvent::Errored(e) => ServiceState::Error { message: e },
     }
+}
+
+/// Append a diagnostic line to %APPDATA%/Penflow/debug.log. Best-effort —
+/// failures here are silently dropped (we don't want logging itself to be
+/// the thing that hangs a service-startup error path).
+fn log_diagnostic(msg: &str) {
+    use std::io::Write;
+    let Some(base) = std::env::var_os("APPDATA").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let dir = base.join("Penflow");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("debug.log");
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "[{now}] {msg}");
 }
 
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
