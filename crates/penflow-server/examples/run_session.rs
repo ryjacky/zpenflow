@@ -174,6 +174,10 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         motion_idr_threshold_bytes: None,
         motion_idr_min_interval: Duration::from_millis(250),
         vdd,
+        // The example doesn't read the GUI's settings.json — leave the
+        // saved topology alone. The GUI's `service.rs` populates this
+        // from `Settings::vdd_resolution` for the production path.
+        vdd_target_resolution: None,
         hud_enabled: true,
     };
 

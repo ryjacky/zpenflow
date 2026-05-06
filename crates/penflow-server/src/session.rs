@@ -43,7 +43,8 @@ use penflow_protocol::{
 use penflow_transport::{Transport, TransportStream};
 
 use crate::vdd::{
-    snapshot_attached_monitor_keys, wait_for_virtual_monitor, VddController, VddError,
+    force_monitor_mode, snapshot_attached_monitor_keys, wait_for_virtual_monitor, VddController,
+    VddError,
 };
 
 /// Session-level errors. Most fan-in from the engine, transport, or protocol;
@@ -130,6 +131,17 @@ pub struct SessionConfig {
     /// `disable()` is called to remove the virtual monitor from idle
     /// desktop. Discovered by `VddController::detect()` at process startup.
     pub vdd: Option<VddController>,
+    /// Desired `(width, height)` for the VDD monitor. After Windows attaches
+    /// the virtual output via `SDC_TOPOLOGY_EXTEND`, the session compares
+    /// the actual mode DXGI reports against this target and — if they
+    /// disagree — calls `force_monitor_mode` to override the saved
+    /// topology. Required because `vdd_settings.xml` controls what the
+    /// driver publishes via EDID, but Windows replays the *last saved*
+    /// extend topology (which can be a stale resolution) under
+    /// `SDC_VIRTUAL_MODE_AWARE` virtual scaling — so refresh rate
+    /// follows the new xml while resolution stays pinned. `None` skips the
+    /// override (legacy behaviour).
+    pub vdd_target_resolution: Option<(u32, u32)>,
     /// Whether the Android HUD overlay should be enabled. Forwarded to
     /// the client via `MSG_CLIENT_CONFIG` immediately after the handshake.
     pub hud_enabled: bool,
@@ -182,6 +194,7 @@ impl Default for SessionConfig {
             motion_idr_threshold_bytes: None,
             motion_idr_min_interval: Duration::from_millis(250),
             vdd: None,
+            vdd_target_resolution: None,
             hud_enabled: true,
         }
     }
@@ -312,7 +325,7 @@ impl Session {
             // generous; if we hit this we genuinely have a driver/topology
             // problem.
             let instance_id = vdd.instance_id().to_string();
-            let virt = wait_for_virtual_monitor(
+            let mut virt = wait_for_virtual_monitor(
                 Duration::from_secs(15),
                 Some(&instance_id),
                 Some(&baseline_attached),
@@ -322,6 +335,54 @@ impl Session {
                 "[session] virtual monitor up: {} {}x{} on {} (adapter LUID 0x{:016x})",
                 virt.device_name, virt.width, virt.height, virt.adapter_name, virt.adapter_luid
             );
+
+            // Saved-topology override. SDC_TOPOLOGY_EXTEND replayed the
+            // last saved extend topology, which may pin a stale resolution
+            // (different from what vdd_settings.xml just published).
+            // Symptom on the dev rig: refresh-rate xml changes apply,
+            // resolution xml changes don't. Force the desired mode via
+            // ChangeDisplaySettingsExW(CDS_UPDATEREGISTRY) so subsequent
+            // enables read the correct mode from the saved topology too.
+            if let Some((target_w, target_h)) = self.cfg.vdd_target_resolution {
+                if virt.width as u32 != target_w || virt.height as u32 != target_h {
+                    eprintln!(
+                        "[session] VDD resolution mismatch — actual {}x{}, target {}x{}; forcing via ChangeDisplaySettingsEx",
+                        virt.width, virt.height, target_w, target_h
+                    );
+                    if let Err(e) =
+                        force_monitor_mode(&virt.device_name, target_w, target_h, self.cfg.fps)
+                    {
+                        eprintln!(
+                            "[session] force_monitor_mode failed: {e} — continuing at {}x{}",
+                            virt.width, virt.height
+                        );
+                    } else {
+                        // Re-poll DXGI for the now-applied dims so the engine
+                        // sees the right size. Reuse the same baseline /
+                        // instance filter; the monitor is still attached, we
+                        // just want refreshed width/height.
+                        match wait_for_virtual_monitor(
+                            Duration::from_secs(3),
+                            Some(&instance_id),
+                            Some(&baseline_attached),
+                        )
+                        .await
+                        {
+                            Ok(refreshed) => {
+                                eprintln!(
+                                    "[session] VDD resolution forced: {} {}x{}",
+                                    refreshed.device_name, refreshed.width, refreshed.height
+                                );
+                                virt = refreshed;
+                            }
+                            Err(e) => eprintln!(
+                                "[session] re-poll after force_monitor_mode failed: {e} — proceeding with stale dims {}x{}",
+                                virt.width, virt.height
+                            ),
+                        }
+                    }
+                }
+            }
 
             // Cross-adapter check: NVIDIA exposes the RTX 5070 as multiple
             // logical DXGI adapters (one with desktop outputs + NVENC,

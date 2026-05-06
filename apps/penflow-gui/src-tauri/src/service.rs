@@ -353,6 +353,10 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         }
     }
 
+    let vdd_target_resolution = vdd
+        .as_ref()
+        .map(|_| (s.vdd_resolution.width, s.vdd_resolution.height));
+
     SessionConfig {
         monitor: attached,
         codec: s.codec.into(),
@@ -362,6 +366,7 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         motion_idr_threshold_bytes: None,
         motion_idr_min_interval: Duration::from_millis(250),
         vdd,
+        vdd_target_resolution,
         hud_enabled: s.hud_enabled,
     }
 }

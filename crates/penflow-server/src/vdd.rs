@@ -59,6 +59,10 @@ use windows::Win32::Devices::Display::{
     SetDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_TOPOLOGY_EXTEND, SDC_VIRTUAL_MODE_AWARE,
     SDC_VIRTUAL_REFRESH_RATE_AWARE,
 };
+use windows::Win32::Graphics::Gdi::{
+    ChangeDisplaySettingsExW, CDS_UPDATEREGISTRY, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
+    DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
+};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{
@@ -517,6 +521,56 @@ fn extend_desktop_to_available_displays() -> Result<(), VddError> {
         Err(VddError::DisplayConfig(format!(
             "SetDisplayConfig(SDC_TOPOLOGY_EXTEND) returned {code}: {}",
             std::io::Error::from_raw_os_error(code)
+        )))
+    }
+}
+
+/// Force a specific GDI device (`\\.\DISPLAYn`) to a given mode and write
+/// the change to the saved-topology database via `CDS_UPDATEREGISTRY`.
+///
+/// Why this exists: `SDC_TOPOLOGY_EXTEND` replays the most recently saved
+/// extend topology. If the user changed the VDD's published resolution in
+/// `vdd_settings.xml`, the saved topology still pins the OLD resolution
+/// — Windows applies it via `SDC_VIRTUAL_MODE_AWARE` (virtual scaling) so
+/// refresh rate updates correctly but resolution sticks. Calling
+/// `ChangeDisplaySettingsExW` with `CDS_UPDATEREGISTRY` after the extend
+/// both applies the new mode dynamically AND replaces the saved entry,
+/// so subsequent enable cycles read the correct mode.
+pub fn force_monitor_mode(
+    device_name: &str,
+    width: u32,
+    height: u32,
+    refresh_hz: u32,
+) -> Result<(), VddError> {
+    let mut devmode: DEVMODEW = unsafe { std::mem::zeroed() };
+    devmode.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    devmode.dmPelsWidth = width;
+    devmode.dmPelsHeight = height;
+    devmode.dmDisplayFrequency = refresh_hz;
+    devmode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+
+    let wide: Vec<u16> = device_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let device_pcwstr = PCWSTR(wide.as_ptr());
+
+    let result = unsafe {
+        ChangeDisplaySettingsExW(
+            device_pcwstr,
+            Some(&devmode as *const DEVMODEW),
+            None,
+            CDS_UPDATEREGISTRY,
+            None,
+        )
+    };
+
+    if result == DISP_CHANGE_SUCCESSFUL {
+        Ok(())
+    } else {
+        Err(VddError::DisplayConfig(format!(
+            "ChangeDisplaySettingsExW({device_name}, {width}x{height}@{refresh_hz}Hz) returned DISP_CHANGE={}",
+            result.0
         )))
     }
 }
