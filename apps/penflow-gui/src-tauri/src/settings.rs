@@ -322,6 +322,14 @@ fn render_vdd_settings_xml(resolution: DisplayResolution) -> String {
         <CustomEdid>false</CustomEdid>
         <PreventSpoof>false</PreventSpoof>
         <EdidCeaOverride>false</EdidCeaOverride>
+        <!-- HardwareCursor=true: the OS does NOT paint the cursor into the
+             VDD framebuffer (no DWM software-cursor compose step on this
+             monitor). The capture pipeline composites the cursor itself
+             via penflow-core::cursor_blit just before NV12 conversion,
+             using the position+shape DDA reports through
+             DXGI_OUTDUPL_FRAME_INFO. Saves the one-frame DWM-compose
+             latency the false setting paid for; cost is ~10-30 µs/frame
+             of GPU blit. -->
         <HardwareCursor>true</HardwareCursor>
         <SDR10bit>false</SDR10bit>
         <HDRPlus>false</HDRPlus>
