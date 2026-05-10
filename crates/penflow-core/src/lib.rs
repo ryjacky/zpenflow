@@ -282,6 +282,9 @@ impl EngineBuilder {
                 acquire_timeout: self.acquire_timeout,
                 packet_queue_capacity: self.packet_queue_capacity,
                 pts_epoch: self.pts_epoch.unwrap_or_else(Instant::now),
+                // Composite only on virtual displays (the bundled VDD).
+                // See `PipelineConfig::compose_cursor`.
+                compose_cursor: monitor.looks_virtual,
             },
         )?;
 
