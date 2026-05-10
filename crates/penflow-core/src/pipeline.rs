@@ -98,6 +98,15 @@ pub struct PipelineConfig {
     /// instead of the actual ~20 ms e2e. The session passes its own
     /// `session_start` so both clocks share an epoch.
     pub pts_epoch: Instant,
+    /// Whether to composite the OS cursor onto the keepalive each tick.
+    /// Required for VDD captures (HardwareCursor=true means the cursor is
+    /// never in the framebuffer); off for physical-monitor capture, where
+    /// the visible content of cursor sprites doesn't always align with
+    /// the reported HotSpot — most visibly the Windows Ink pen-tip dot,
+    /// which renders offset top-left of the click point. With it off on
+    /// physical capture, no cursor shows on the tablet, but no visible
+    /// misalignment either.
+    pub compose_cursor: bool,
 }
 
 impl Default for PipelineConfig {
@@ -113,6 +122,7 @@ impl Default for PipelineConfig {
             acquire_timeout: Duration::from_millis(16),
             packet_queue_capacity: 2,
             pts_epoch: Instant::now(),
+            compose_cursor: true,
         }
     }
 }
@@ -154,19 +164,24 @@ impl Pipeline {
 
         // Cursor compositor: bound once to the keepalive's RTV. Failing to
         // build it shouldn't kill the session — fall back to a no-cursor
-        // stream rather than refusing to start. The most likely failure is
-        // D3DCompile / D3DCompiler_47.dll missing, which is rare on Win10+
-        // but possible on hardened images.
-        let cursor_blitter = match CursorBlitter::new(&ctx, &keepalive, cfg.width, cfg.height) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                eprintln!(
-                    "[pipeline] CursorBlitter::new failed ({:?}); cursor will not be visible \
-                     in the stream. Set HardwareCursor=false in vdd_settings.xml as a fallback.",
-                    e
-                );
-                None
+        // stream rather than refusing to start. Skipped entirely when
+        // `cfg.compose_cursor` is false (physical-monitor capture); see
+        // `PipelineConfig::compose_cursor`.
+        let cursor_blitter = if cfg.compose_cursor {
+            match CursorBlitter::new(&ctx, &keepalive, cfg.width, cfg.height) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    eprintln!(
+                        "[pipeline] CursorBlitter::new failed ({:?}); cursor will not be visible \
+                         in the stream. Set HardwareCursor=false in vdd_settings.xml as a fallback.",
+                        e
+                    );
+                    None
+                }
             }
+        } else {
+            eprintln!("[pipeline] cursor compositor disabled — relying on framebuffer cursor");
+            None
         };
 
         let q = Arc::clone(&queue);
