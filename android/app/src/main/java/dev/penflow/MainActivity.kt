@@ -125,6 +125,7 @@ class MainActivity : Activity() {
                     surfaceView.visibility =
                         if (cfg.screenOff) android.view.View.GONE
                         else android.view.View.VISIBLE
+                    applyScreenBrightness(cfg.screenOff)
                 }
             },
         )
@@ -183,6 +184,32 @@ class MainActivity : Activity() {
             } else {
                 applyContainLayout(st.width, st.height)
             }
+        }
+    }
+
+    /** Drive the panel brightness via the window's
+     *  `WindowManager.LayoutParams.screenBrightness` — `0f` is the
+     *  panel's minimum, `BRIGHTNESS_OVERRIDE_NONE = -1f` returns to the
+     *  user's system setting. We don't request `WRITE_SETTINGS` (that
+     *  would be a global, persistent change); the per-window override
+     *  applies only while this activity is foregrounded and reverts
+     *  cleanly when the user backgrounds the app. */
+    private fun applyScreenBrightness(dim: Boolean) {
+        val lp = window.attributes
+        val target = if (dim) {
+            // Some panels treat exactly 0 as "off"; 0.01 keeps the panel
+            // technically lit but at the minimum the firmware allows,
+            // which both saves OLED burn and avoids weird "is the device
+            // dead?" UX. Above 0 also keeps the touch digitizer awake on
+            // panels that gate it on backlight power.
+            0.01f
+        } else {
+            WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        }
+        if (lp.screenBrightness != target) {
+            lp.screenBrightness = target
+            window.attributes = lp
+            Log.i(TAG, "screen_off=$dim — brightness override = $target")
         }
     }
 
