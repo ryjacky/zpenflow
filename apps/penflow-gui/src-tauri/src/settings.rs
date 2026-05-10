@@ -52,6 +52,15 @@ pub struct Settings {
     /// skips the VDD and captures the primary monitor directly.
     #[serde(default)]
     pub topology: TopologyMode,
+    /// Pen-tablet "screen off" mode. When `true` AND `topology` is
+    /// `Duplicate`, the session skips capture / encode / video send
+    /// entirely — the Android panel goes dark and pen + touch still flow
+    /// as input. Saves PC CPU/GPU cycles and tablet battery while still
+    /// letting the user draw on the primary monitor like a Wacom Intuos.
+    /// Ignored in `Extend` topology (the toggle in the GUI is hidden
+    /// there) — drawing on a phantom monitor nobody can see is useless.
+    #[serde(default)]
+    pub screen_off: bool,
 }
 
 fn default_hud_enabled() -> bool {
@@ -70,6 +79,7 @@ impl Default for Settings {
             run_as_admin: false,
             hud_enabled: default_hud_enabled(),
             topology: TopologyMode::default(),
+            screen_off: false,
         }
     }
 }

@@ -35,10 +35,10 @@ use penflow_core::Engine;
 use penflow_protocol::{
     encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, ClientConfig,
     HelloAndroid, HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame,
-    CLIENT_CFG_FLAG_HUD, CODEC_H264, CODEC_HEVC, FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME,
-    MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG, MSG_HELLO_ANDROID, MSG_HELLO_PC, MSG_PC_GOODBYE,
-    MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP,
-    MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
+    CLIENT_CFG_FLAG_HUD, CLIENT_CFG_FLAG_SCREEN_OFF, CODEC_H264, CODEC_HEVC, FRAME_FLAG_EXTENDED,
+    FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG, MSG_HELLO_ANDROID, MSG_HELLO_PC,
+    MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ,
+    MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
 };
 use penflow_transport::{Transport, TransportStream};
 
@@ -145,6 +145,16 @@ pub struct SessionConfig {
     /// Whether the Android HUD overlay should be enabled. Forwarded to
     /// the client via `MSG_CLIENT_CONFIG` immediately after the handshake.
     pub hud_enabled: bool,
+    /// Pen-tablet "screen off" mode. When `true`, the session skips
+    /// `Engine::start`, never sends `MSG_VIDEO_CONFIG` or
+    /// `MSG_VIDEO_FRAME`, and runs only the input dispatch loop. The
+    /// `MSG_CLIENT_CONFIG` flag tells the Android side to drop its
+    /// decoder and blank the panel. Pen + touch still flow as normal so
+    /// the tablet behaves like a Wacom Intuos pointed at the primary
+    /// monitor. Caller (the GUI service layer) is responsible for only
+    /// setting this when `topology == Duplicate` — drawing on a phantom
+    /// VDD monitor with no display is useless.
+    pub screen_off: bool,
     /// Pen-button bindings to apply on the per-session injector. Default
     /// is the engine's `PenButtonProfile::default()` (Ctrl/Shift/E). The
     /// GUI converts user-edited `settings::PenBindings` to this struct
@@ -202,6 +212,7 @@ impl Default for SessionConfig {
             vdd: None,
             vdd_target_resolution: None,
             hud_enabled: true,
+            screen_off: false,
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
         }
     }
@@ -270,6 +281,14 @@ impl Session {
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     ) -> Result<(), SessionError> {
+        // Pen-tablet "screen off" mode is a fundamentally different
+        // shape (no engine, no video pumps, no IDR machinery) — peel it
+        // off the front so the streaming path below stays linear and
+        // untouched.
+        if self.cfg.screen_off {
+            return self.run_screen_off(transport, events).await;
+        }
+
         let session_start = Instant::now();
 
         // 1. Accept the transport FIRST. Engine startup happens after the
@@ -648,6 +667,177 @@ impl Session {
         // topology automatically when the VDD output disappears, so
         // we don't need to call SetDisplayConfig ourselves on the way
         // out.
+
+        if let Some(tx) = &events {
+            match &read_result {
+                Ok(()) => {
+                    let _ = tx.send(SessionEvent::Disconnected).await;
+                }
+                Err(e) => {
+                    let _ = tx.send(SessionEvent::Errored(format!("{e}"))).await;
+                }
+            }
+        }
+        read_result
+    }
+
+    /// Pen-tablet "screen off" path. Same handshake shape as `run` for
+    /// transport/`HELLO_ANDROID`/`HELLO_PC`/`MSG_CLIENT_CONFIG` so the
+    /// Android client doesn't need a special handshake mode — it just
+    /// reads `CLIENT_CFG_FLAG_SCREEN_OFF` and stops waiting for video.
+    /// Everything below `MSG_CLIENT_CONFIG` (no `MSG_VIDEO_CONFIG`, no
+    /// frame pump, no telemetry pump, no engine) is intentionally
+    /// missing because there is nothing to encode or stream.
+    ///
+    /// Pen + touch input still flow over the wire, mapped through the
+    /// same `AffineTransform` against the configured monitor (which is
+    /// the primary in `Duplicate` topology — service.rs only lets
+    /// `screen_off` take effect there). Net effect: dark glass that
+    /// behaves like a Wacom Intuos pointed at the primary monitor.
+    async fn run_screen_off(
+        self,
+        transport: Arc<dyn Transport>,
+        events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
+    ) -> Result<(), SessionError> {
+        // Defensive: the GUI service layer is supposed to only set
+        // `screen_off` when topology=Duplicate (which forces vdd=None),
+        // so the streaming-only VDD lifecycle never fires here. If an
+        // older settings.json arrives somehow, just refuse to enable
+        // VDD rather than spin up a virtual monitor only to never show
+        // anything on it.
+        debug_assert!(
+            self.cfg.vdd.is_none(),
+            "screen_off + VDD configured — service.rs should have gated this"
+        );
+
+        let session_start = Instant::now();
+
+        let stream = transport.accept().await?;
+        let TransportStream {
+            mut reader,
+            mut writer,
+            peer_label,
+        } = stream;
+
+        if let Some(tx) = &events {
+            let _ = tx
+                .send(SessionEvent::Connecting {
+                    peer: peer_label.clone(),
+                })
+                .await;
+        }
+
+        let (msg_id, payload) = read_frame(&mut reader).await?;
+        if msg_id != MSG_HELLO_ANDROID {
+            return Err(SessionError::UnexpectedHandshakeMessage(msg_id));
+        }
+        let android = HelloAndroid::decode(&payload)?;
+        eprintln!(
+            "[session] HELLO_ANDROID (screen_off) from {}: tablet {}x{} pen_max_pressure={}",
+            peer_label, android.display_width, android.display_height, android.pen_max_pressure,
+        );
+
+        // The configured monitor is the pen's target rect. In Duplicate
+        // topology service.rs sets this to the primary attached output;
+        // pen normalised coords land on that monitor's pixels via the
+        // standard AffineTransform.
+        let monitor = self.cfg.monitor.clone();
+        eprintln!(
+            "[session] screen_off — capture+encode SKIPPED; pen targets {} ({}x{} at {:?})",
+            monitor.device_name, monitor.width, monitor.height, monitor.desktop_coords,
+        );
+
+        // Same injector + binding setup as the streaming path. Touch
+        // events still go through the absolute-touch synthetic-pointer
+        // device; the Android side maps multi-touch onto the primary
+        // monitor like a Wacom Intuos with multi-finger support.
+        let injector = Arc::new(Mutex::new(InputInjector::new()?));
+        injector
+            .lock()
+            .await
+            .set_pen_profile(self.cfg.pen_profile.clone());
+        let rotation_deg: u32 = match monitor.rotation {
+            2 => 90,
+            3 => 180,
+            4 => 270,
+            _ => 0,
+        };
+        let coords = AffineTransform::from_normalized_to_rect(
+            monitor.desktop_coords.0,
+            monitor.desktop_coords.1,
+            monitor.width,
+            monitor.height,
+            rotation_deg,
+        );
+
+        // HELLO_PC. width/height come from the chosen monitor so the
+        // Android status line still has something to display
+        // ("connected 1920x1080") even though no video will follow.
+        // codec/bitrate/fps are placeholders the Android side ignores
+        // once it sees the SCREEN_OFF flag.
+        let codec_wire_id = match self.cfg.codec {
+            Codec::H264 => CODEC_H264,
+            Codec::Hevc => CODEC_HEVC,
+        };
+        let hello_pc = HelloPc {
+            protocol_version: 0,
+            width: monitor.width.min(u16::MAX as u32) as u16,
+            height: monitor.height.min(u16::MAX as u32) as u16,
+            codec: codec_wire_id,
+            bitrate_bps: self.cfg.bitrate_bps,
+            fps: self.cfg.fps.min(255) as u8,
+        };
+        write_frame(&mut writer, MSG_HELLO_PC, &hello_pc.encode()).await?;
+
+        // CLIENT_CONFIG carries the SCREEN_OFF bit. Older clients that
+        // don't know the bit fall back to "wait for VIDEO_CONFIG" and
+        // hang — that's fine, the GUI hides the toggle from end users
+        // who haven't updated the Android app.
+        let mut cfg_flags = CLIENT_CFG_FLAG_SCREEN_OFF;
+        if self.cfg.hud_enabled {
+            cfg_flags |= CLIENT_CFG_FLAG_HUD;
+        }
+        let client_cfg = ClientConfig { flags: cfg_flags };
+        write_frame(&mut writer, MSG_CLIENT_CONFIG, &client_cfg.encode()).await?;
+        writer.flush().await?;
+
+        if let Some(tx) = &events {
+            let _ = tx
+                .send(SessionEvent::Connected {
+                    peer: peer_label.clone(),
+                    device_width: android.display_width,
+                    device_height: android.display_height,
+                })
+                .await;
+        }
+
+        let writer = Arc::new(Mutex::new(writer));
+        // read_loop's signature still expects an idr_tx sender — the
+        // streaming path uses it to nudge the engine into emitting an
+        // IDR. With no engine, MSG_REQUEST_IDR from the client is a
+        // harmless no-op; we drop the receiver so the unbounded channel
+        // just buffers (and disappears with the session).
+        let (idr_tx, _idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let read_result = read_loop(
+            reader,
+            writer.clone(),
+            injector,
+            coords,
+            android.display_width,
+            android.display_height,
+            idr_tx,
+            session_start,
+        )
+        .await;
+
+        // Clean shutdown so the Android side logs a goodbye instead of
+        // an EOF.
+        {
+            let mut w = writer.lock().await;
+            let _ = write_frame(&mut *w, MSG_PC_GOODBYE, &[]).await;
+            let _ = w.flush().await;
+        }
 
         if let Some(tx) = &events {
             match &read_result {

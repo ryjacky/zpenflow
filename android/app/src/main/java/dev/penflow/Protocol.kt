@@ -24,6 +24,12 @@ object Protocol {
 
     // Bits in CLIENT_CONFIG.flags
     const val CLIENT_CFG_FLAG_HUD = 1 shl 0
+    /** PC ran the session in pen-tablet "screen off" mode — capture and
+     *  encode were skipped on the server, so no VIDEO_CONFIG / VIDEO_FRAME
+     *  messages will arrive. Client should drop the decoder, hide the
+     *  rendering surface, and treat the panel as input-only. Pen + touch
+     *  events still flow over the wire as normal. */
+    const val CLIENT_CFG_FLAG_SCREEN_OFF = 1 shl 1
 
     // Android -> PC
     const val MSG_HELLO_ANDROID: Byte = 0x81.toByte()
@@ -110,6 +116,7 @@ object Protocol {
     /** Decoded MSG_CLIENT_CONFIG payload (server-issued client preferences). */
     data class ClientConfig(val flags: Int) {
         val hudEnabled: Boolean get() = (flags and CLIENT_CFG_FLAG_HUD) != 0
+        val screenOff: Boolean get() = (flags and CLIENT_CFG_FLAG_SCREEN_OFF) != 0
     }
 
     /** Lenient: accepts any payload >= 4 bytes; ignores trailing bytes so a

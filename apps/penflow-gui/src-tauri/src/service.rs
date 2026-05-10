@@ -384,6 +384,13 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         vdd,
         vdd_target_resolution,
         hud_enabled: s.hud_enabled,
+        // "Screen off" only ever takes effect in Duplicate topology — in
+        // Extend mode the panel would be the only display showing the
+        // VDD desktop, so blanking it makes the whole feature pointless.
+        // Enforcing the gate here means an old settings.json with
+        // `screen_off: true` paired with a topology change can't
+        // accidentally light it.
+        screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
     }
 }
