@@ -200,11 +200,14 @@ class PenflowClient(
                 Log.i(TAG, "HELLO_PC ${hello.width}x${hello.height}@${hello.fps} codec=${hello.codec}")
 
                 // 3. wait for VIDEO_CONFIG (csd-0). The server may interleave
-                //    other one-shot messages here — currently CLIENT_CONFIG —
-                //    so handle the known ones inline and only warn for truly
-                //    unexpected ids.
+                //    other one-shot messages here — CLIENT_CONFIG, and in
+                //    pen-tablet "screen off" mode that flag tells us no
+                //    VIDEO_CONFIG will ever arrive (capture+encode skipped
+                //    PC-side). Break out of the wait in that case so we
+                //    proceed straight to the input-only session.
                 var csd0: ByteArray? = null
-                while (csd0 == null) {
+                var screenOff = false
+                while (csd0 == null && !screenOff) {
                     val (type, payload) = Protocol.recvMsg(input)
                     when (type) {
                         Protocol.MSG_VIDEO_CONFIG -> {
@@ -213,7 +216,8 @@ class PenflowClient(
                         Protocol.MSG_CLIENT_CONFIG -> {
                             try {
                                 val cfg = Protocol.decodeClientConfig(payload)
-                                Log.i(TAG, "CLIENT_CONFIG (handshake) flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled}")
+                                Log.i(TAG, "CLIENT_CONFIG (handshake) flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled} screen_off=${cfg.screenOff}")
+                                if (cfg.screenOff) screenOff = true
                                 onClientConfig?.invoke(cfg)
                             } catch (e: Exception) {
                                 Log.w(TAG, "CLIENT_CONFIG decode failed: $e (ignoring)")
@@ -225,14 +229,24 @@ class PenflowClient(
                     }
                 }
 
-                // 4. start the decoder once we have a Surface to render to
-                val surface = waitForSurface()
-                val dec = VideoDecoder(
-                    hello.width, hello.height, hello.fps, hello.codec, surface, csd0!!,
-                    onDecoded = { framePtsNs, decodedNs -> onDecoderFrameDone(framePtsNs, decodedNs) },
-                )
-                dec.start()
-                decoder = dec
+                // 4. start the decoder once we have a Surface to render to.
+                //    In screen_off mode we skip this entirely — no video is
+                //    coming, so there's nothing to decode and no need to
+                //    block waiting for a Surface (the activity will hide
+                //    the SurfaceView in response to the CLIENT_CONFIG).
+                val dec: VideoDecoder? = if (screenOff) {
+                    Log.i(TAG, "screen_off — skipping decoder, panel is input-only")
+                    null
+                } else {
+                    val surface = waitForSurface()
+                    VideoDecoder(
+                        hello.width, hello.height, hello.fps, hello.codec, surface, csd0!!,
+                        onDecoded = { framePtsNs, decodedNs -> onDecoderFrameDone(framePtsNs, decodedNs) },
+                    ).also {
+                        it.start()
+                        decoder = it
+                    }
+                }
                 onState(State.Connected(hello.width, hello.height, hello.fps))
 
                 // 5. read frames forever (this is the session lifetime —
@@ -270,11 +284,18 @@ class PenflowClient(
         error("timed out waiting for output Surface")
     }
 
-    private suspend fun readLoop(input: DataInputStream, dec: VideoDecoder) {
+    private suspend fun readLoop(input: DataInputStream, dec: VideoDecoder?) {
         while (true) {
             val (type, payload) = Protocol.recvMsg(input)
             when (type) {
                 Protocol.MSG_VIDEO_FRAME -> {
+                    if (dec == null) {
+                        // screen_off mode — server shouldn't be sending video
+                        // frames in this state; log once if it happens so we
+                        // notice protocol drift.
+                        Log.w(TAG, "VIDEO_FRAME arrived in screen_off mode; dropping (${payload.size} bytes)")
+                        continue
+                    }
                     val recvNs = System.nanoTime()
                     val header = Protocol.decodeVideoFrame(payload)
                     // Record sample BEFORE feeding the decoder — the codec
@@ -300,7 +321,7 @@ class PenflowClient(
                 Protocol.MSG_CLIENT_CONFIG -> {
                     try {
                         val cfg = Protocol.decodeClientConfig(payload)
-                        Log.i(TAG, "CLIENT_CONFIG flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled}")
+                        Log.i(TAG, "CLIENT_CONFIG flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled} screen_off=${cfg.screenOff}")
                         onClientConfig?.invoke(cfg)
                     } catch (e: Exception) {
                         Log.w(TAG, "CLIENT_CONFIG decode failed: $e (ignoring)")

@@ -34,6 +34,14 @@ class MainActivity : Activity() {
     @Volatile
     private var activeRect: Rect = Rect()
 
+    /** Set to true when the PC's CLIENT_CONFIG carries the SCREEN_OFF
+     *  flag — the session is in pen-tablet mode, no video will arrive,
+     *  and we should hide the SurfaceView so the panel reads as a pure
+     *  dark-glass input surface. Stays sticky for the rest of the
+     *  session; reconnects re-evaluate the flag. */
+    @Volatile
+    private var screenOff: Boolean = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -107,6 +115,16 @@ class MainActivity : Activity() {
                     // Views but conceptually one "instrumentation overlay".
                     hud.visibility = vis
                     statusView.visibility = vis
+
+                    // Pen-tablet "screen off" mode: no video, hide the
+                    // SurfaceView so the panel is just dark glass for
+                    // pen + touch input. activeRect stays empty so pen
+                    // capture maps to the full panel (no letterbox bars
+                    // to clip against — there's no video to letterbox).
+                    screenOff = cfg.screenOff
+                    surfaceView.visibility =
+                        if (cfg.screenOff) android.view.View.GONE
+                        else android.view.View.VISIBLE
                 }
             },
         )
@@ -146,10 +164,18 @@ class MainActivity : Activity() {
         statusView.text = when (st) {
             PenflowClient.State.Disconnected -> "disconnected"
             PenflowClient.State.Connecting -> "connecting…"
-            is PenflowClient.State.Connected -> "connected ${st.width}x${st.height}@${st.fps}"
+            is PenflowClient.State.Connected -> if (screenOff)
+                "pen tablet — display off (${st.width}x${st.height} target)"
+            else
+                "connected ${st.width}x${st.height}@${st.fps}"
             is PenflowClient.State.Error -> "error: ${st.message}"
         }
-        if (st is PenflowClient.State.Connected) {
+        // In screen_off mode there's no video, so no letterboxing —
+        // skipping applyContainLayout leaves activeRect empty and pen
+        // capture defaults to "full root view". That's exactly what we
+        // want: every pen sample on the panel maps onto the PC's
+        // primary monitor.
+        if (st is PenflowClient.State.Connected && !screenOff) {
             applyContainLayout(st.width, st.height)
         }
     }
