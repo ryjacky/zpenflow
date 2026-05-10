@@ -36,6 +36,7 @@ use crate::d3d11::D3d11Context;
 use crate::encoder::{EncodeSession, EncodedPacket};
 use crate::error::{EngineError, EngineResult};
 use crate::packet_queue::PacketQueue;
+use crate::tonemap_blit::TonemapBlitter;
 
 /// RAII guard for an MMCSS task subscription. Holds the handle returned by
 /// `AvSetMmThreadCharacteristicsW` and reverts on drop. While alive, the
@@ -98,6 +99,14 @@ pub struct PipelineConfig {
     /// instead of the actual ~20 ms e2e. The session passes its own
     /// `session_start` so both clocks share an epoch.
     pub pts_epoch: Instant,
+    /// "SDR content brightness" slider value, expressed as the scRGB
+    /// multiplier Windows applies to SDR content on a Windows-HDR-on
+    /// desktop. 1.0 = default / HDR off / unknown. Values > 1 are
+    /// common (boosted SDR for OLED HDR setups). Used by the tonemap
+    /// shader to renormalise scRGB before clamping. Queried from
+    /// `DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)` in
+    /// `Engine::start`.
+    pub scrgb_sdr_scale: f32,
 }
 
 impl Default for PipelineConfig {
@@ -113,6 +122,7 @@ impl Default for PipelineConfig {
             acquire_timeout: Duration::from_millis(16),
             packet_queue_capacity: 2,
             pts_epoch: Instant::now(),
+            scrgb_sdr_scale: 1.0,
         }
     }
 }
@@ -169,6 +179,38 @@ impl Pipeline {
             }
         };
 
+        // Tonemap blitter: handles the case where DDA returns a non-BGRA
+        // format (HDR10 PQ from a fullscreen-exclusive HDR app, scRGB
+        // float from a Windows-HDR-on desktop). When the DDA frame is
+        // already BGRA8 we take the `CopyResource` fast path and the
+        // blitter goes unused for the session. Build it eagerly so we
+        // surface shader-compile failures at session start rather than
+        // mid-stream when HDR happens to switch on.
+        let tonemap_blitter = match TonemapBlitter::new(&ctx, &keepalive, cfg.width, cfg.height) {
+            Ok(b) => {
+                // Push the user's "SDR content brightness" slider value
+                // into the shader cbuffer. Without this, scRGB inputs
+                // get clamp-clipped at 1.0 and any SDR content the
+                // user has boosted above 80 nits looks "blown out" on
+                // the tablet — the visible "Windows UI is overexposed"
+                // symptom. See `sdr_white_level.rs`.
+                b.set_scrgb_sdr_scale(cfg.scrgb_sdr_scale);
+                eprintln!(
+                    "[pipeline] tonemap blitter ready; scRGB SDR scale = {:.3}",
+                    cfg.scrgb_sdr_scale,
+                );
+                Some(b)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[pipeline] TonemapBlitter::new failed ({:?}); HDR-display capture will \
+                     show as black. SDR (BGRA) capture is unaffected.",
+                    e
+                );
+                None
+            }
+        };
+
         let q = Arc::clone(&queue);
         let s = Arc::clone(&stop);
         let idr = Arc::clone(&idr_request);
@@ -196,6 +238,7 @@ impl Pipeline {
                     encoder,
                     keepalive,
                     cursor_blitter,
+                    tonemap_blitter,
                     last_pointer: None,
                     queue: q,
                     stop: s,
@@ -204,6 +247,7 @@ impl Pipeline {
                     cfg,
                     has_real_frame: false,
                     start_instant: pts_epoch,
+                    last_dda_format: None,
                 };
                 state.run()
             })
@@ -268,6 +312,12 @@ struct LoopState {
     /// `None` if compositor failed to build (see Pipeline::start). When
     /// `None`, cursor blits are silently skipped.
     cursor_blitter: Option<CursorBlitter>,
+    /// Format-conversion + tonemap shader, used when DDA returns
+    /// non-BGRA frames (HDR10 PQ, scRGB float). `None` only if shader
+    /// compile failed at startup — in which case HDR captures will be
+    /// black. SDR captures fall through to the `CopyResource` fast
+    /// path and don't depend on this.
+    tonemap_blitter: Option<TonemapBlitter>,
     /// Last pointer position seen from DDA. Persisted across frames because
     /// `AcquiredFrame::pointer_position()` returns `None` on frames where
     /// the cursor didn't move; we still need to draw it at the previous
@@ -280,6 +330,10 @@ struct LoopState {
     cfg: PipelineConfig,
     has_real_frame: bool,
     start_instant: Instant,
+    /// Last DDA format we logged the routing decision for. Lets us emit
+    /// one log line per format transition (HDR toggled, monitor swap)
+    /// instead of every tick. `None` until the first frame.
+    last_dda_format: Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
 }
 
 impl LoopState {
@@ -321,13 +375,65 @@ impl LoopState {
                         describe_texture("keepalive_before_copy", &self.keepalive)
                     );
                 }
-                // Copy DXGI texture → stable BGRA keepalive (GPU-only copy,
-                // ~150 us on RTX 5070 for 4K). The frame's RAII guard
-                // releases the duplication when it goes out of scope.
-                unsafe {
-                    self.ctx
-                        .immediate_context
-                        .CopyResource(&self.keepalive, &frame.texture);
+
+                // Move DDA pixels into the BGRA keepalive. Two paths:
+                //
+                //   - **Fast path**: when DDA returns BGRA8 (the common
+                //     SDR case, also always true for the bundled VDD),
+                //     `CopyResource` is a pure GPU memcpy — ~150 µs at
+                //     4K on RTX 5070.
+                //
+                //   - **Tonemap path**: when DDA returns RGBA8 / HDR10
+                //     PQ / scRGB float, run a pixel shader that does
+                //     transfer-function decode + tonemap + sRGB encode.
+                //     Sits at ~300-500 µs at 4K. Required because
+                //     `CopyResource` between mismatched formats silently
+                //     no-ops, leaving the keepalive black (the bug
+                //     behind "tablet shows black + only the cursor").
+                //
+                // The tonemap blitter is `None` only if shader
+                // compilation failed at session start; in that case we
+                // fall through to `CopyResource` for everything, which
+                // will be visibly broken on HDR sources but at least
+                // SDR captures still work.
+                let dda_format = texture_format(&frame.texture);
+                let needs_tonemap = !is_bgra8(dda_format);
+                if needs_tonemap {
+                    if let Some(blitter) = self.tonemap_blitter.as_ref() {
+                        log_format_change_once(&mut self.last_dda_format, dda_format);
+                        if let Err(e) = blitter.convert(&self.ctx, &frame.texture, dda_format) {
+                            eprintln!(
+                                "[pipeline] tonemap convert ERR (fmt={}): {e:?} — \
+                                 falling back to CopyResource (will be black)",
+                                dda_format.0
+                            );
+                            unsafe {
+                                self.ctx
+                                    .immediate_context
+                                    .CopyResource(&self.keepalive, &frame.texture);
+                            }
+                        }
+                    } else {
+                        // Tonemap blitter unavailable (shader compile
+                        // failed at startup). Logging once is enough —
+                        // every subsequent tick would otherwise spam.
+                        log_format_change_once(&mut self.last_dda_format, dda_format);
+                        unsafe {
+                            self.ctx
+                                .immediate_context
+                                .CopyResource(&self.keepalive, &frame.texture);
+                        }
+                    }
+                } else {
+                    // BGRA8 fast path. Reset the "last format we logged
+                    // about" tracker so a future HDR-on toggle gets
+                    // logged again.
+                    log_format_change_once(&mut self.last_dda_format, dda_format);
+                    unsafe {
+                        self.ctx
+                            .immediate_context
+                            .CopyResource(&self.keepalive, &frame.texture);
+                    }
                 }
                 self.has_real_frame = true;
 
@@ -456,6 +562,51 @@ fn describe_texture(
     )
 }
 
+/// Read just the texture's DXGI format. Used by the pipeline tick to
+/// route between the BGRA `CopyResource` fast path and the HDR-aware
+/// `TonemapBlitter`.
+fn texture_format(
+    tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+    unsafe { tex.GetDesc(&mut desc) };
+    desc.Format
+}
+
+/// Whether the DDA format can take the `CopyResource` fast path.
+/// D3D11 `CopyResource` requires identical source/destination formats,
+/// so this is strictly `B8G8R8A8_UNORM`. RGBA8, R10G10B10A2, and
+/// RGBA16F all go through the tonemap shader.
+fn is_bgra8(fmt: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> bool {
+    fmt == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM
+}
+
+/// Log a single line when the DDA format changes from one tick to the
+/// next. Routine ticks within the same format are silent — adapter
+/// changes are infrequent (HDR toggle, monitor swap, fullscreen-HDR
+/// game launch) and worth surfacing without `PENFLOW_PIPELINE_TRACE`.
+fn log_format_change_once(
+    last: &mut Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
+    current: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) {
+    if *last == Some(current) {
+        return;
+    }
+    let prev_str = last
+        .map(|f| format!("{}", f.0))
+        .unwrap_or_else(|| "<initial>".into());
+    let path = if is_bgra8(current) {
+        "CopyResource fast path"
+    } else {
+        "TonemapBlitter shader path"
+    };
+    eprintln!(
+        "[pipeline] DDA format {} → {} ({})",
+        prev_str, current.0, path
+    );
+    *last = Some(current);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +638,7 @@ mod tests {
             acquire_timeout: Duration::from_millis(50),
             packet_queue_capacity: 16,
             pts_epoch: Instant::now(),
+            scrgb_sdr_scale: 1.0,
         };
         let conv = ColorConverter::new(&ctx, cfg.width, cfg.height, cfg.fps).expect("conv");
         // Build the encoder session BEFORE moving ctx into the capturer
