@@ -170,6 +170,8 @@ class MainActivity : Activity() {
             // the target monitor's aspect ratio — otherwise pen strokes
             // would be stretched in screen_off when panel and monitor
             // aspects differ. SurfaceView resize is a no-op when GONE.
+            // TODO: expose a "Mapping" setting in the GUI (aspect-fit /
+            // stretch / custom rect) so power users can pick.
             applyContainLayout(st.width, st.height)
         }
     }
