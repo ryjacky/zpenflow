@@ -52,10 +52,8 @@ pub struct Settings {
     /// skips the VDD and captures the primary monitor directly.
     #[serde(default)]
     pub topology: TopologyMode,
-    /// Pen-tablet "screen off" mode: only active when `topology ==
-    /// Duplicate`. Panel goes dark, capture+encode skipped, pen+touch
-    /// still flow as input. Ignored in `Extend` (no point blanking the
-    /// only display showing the VDD desktop); GUI hides the toggle there.
+    /// Pen-tablet screen-off mode (Duplicate topology only). Panel dark,
+    /// capture+encode skipped; pen + touch still flow.
     #[serde(default)]
     pub screen_off: bool,
 }

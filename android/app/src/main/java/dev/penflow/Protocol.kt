@@ -24,11 +24,8 @@ object Protocol {
 
     // Bits in CLIENT_CONFIG.flags
     const val CLIENT_CFG_FLAG_HUD = 1 shl 0
-    /** PC ran the session in pen-tablet "screen off" mode — capture and
-     *  encode were skipped on the server, so no VIDEO_CONFIG / VIDEO_FRAME
-     *  messages will arrive. Client should drop the decoder, hide the
-     *  rendering surface, and treat the panel as input-only. Pen + touch
-     *  events still flow over the wire as normal. */
+    /** Screen-off mode: no VIDEO_CONFIG/VIDEO_FRAME will arrive. Drop the
+     *  decoder and hide the rendering surface. Pen + touch still flow. */
     const val CLIENT_CFG_FLAG_SCREEN_OFF = 1 shl 1
 
     // Android -> PC

@@ -34,11 +34,8 @@ class MainActivity : Activity() {
     @Volatile
     private var activeRect: Rect = Rect()
 
-    /** Set to true when the PC's CLIENT_CONFIG carries the SCREEN_OFF
-     *  flag — the session is in pen-tablet mode, no video will arrive,
-     *  and we should hide the SurfaceView so the panel reads as a pure
-     *  dark-glass input surface. Stays sticky for the rest of the
-     *  session; reconnects re-evaluate the flag. */
+    /** Mirrors the PC's CLIENT_CONFIG SCREEN_OFF bit. Sticky per
+     *  session; re-evaluated on reconnect. */
     @Volatile
     private var screenOff: Boolean = false
 
@@ -116,11 +113,6 @@ class MainActivity : Activity() {
                     hud.visibility = vis
                     statusView.visibility = vis
 
-                    // Pen-tablet "screen off" mode: no video, hide the
-                    // SurfaceView so the panel is just dark glass for
-                    // pen + touch input. activeRect stays empty so pen
-                    // capture maps to the full panel (no letterbox bars
-                    // to clip against — there's no video to letterbox).
                     screenOff = cfg.screenOff
                     surfaceView.visibility =
                         if (cfg.screenOff) android.view.View.GONE
@@ -173,13 +165,9 @@ class MainActivity : Activity() {
         }
         if (st is PenflowClient.State.Connected) {
             if (screenOff) {
-                // No letterboxing in screen_off mode (there's no video to
-                // fit), but we MUST set activeRect to the full panel —
-                // PenInputCapture's normalisation divides by rect.width
-                // and rect.height, and the default `Rect()` has zero
-                // width/height which `coerceAtLeast(1)` turns into 1px,
-                // collapsing every pen sample to (1.0, 1.0) i.e. the
-                // bottom-right corner of the PC's primary monitor.
+                // Must set activeRect to a non-empty rect; PenInputCapture
+                // divides by rect.width/height and the default empty Rect
+                // collapses every sample to (1.0, 1.0).
                 applyFullPanelRect()
             } else {
                 applyContainLayout(st.width, st.height)
@@ -187,8 +175,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Per-window brightness override: minimum while dim, system default
-     *  otherwise. No `WRITE_SETTINGS` needed; reverts on background. */
+    /** Per-window brightness override; no WRITE_SETTINGS needed. */
     private fun applyScreenBrightness(dim: Boolean) {
         val lp = window.attributes
         val target = if (dim) {
@@ -203,9 +190,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /** Set activeRect to the entire root view so pen + touch capture
-     *  cover the whole panel — the screen_off counterpart of
-     *  applyContainLayout's video-fit rect. */
+    /** activeRect = whole panel. Screen_off counterpart of applyContainLayout. */
     private fun applyFullPanelRect() {
         val root = findViewById<View>(android.R.id.content)
         root.post {

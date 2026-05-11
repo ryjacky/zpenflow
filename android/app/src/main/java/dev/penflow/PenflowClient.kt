@@ -199,12 +199,8 @@ class PenflowClient(
                 val hello = Protocol.decodeHelloPc(helloPayload)
                 Log.i(TAG, "HELLO_PC ${hello.width}x${hello.height}@${hello.fps} codec=${hello.codec}")
 
-                // 3. wait for VIDEO_CONFIG (csd-0). The server may interleave
-                //    other one-shot messages here — CLIENT_CONFIG, and in
-                //    pen-tablet "screen off" mode that flag tells us no
-                //    VIDEO_CONFIG will ever arrive (capture+encode skipped
-                //    PC-side). Break out of the wait in that case so we
-                //    proceed straight to the input-only session.
+                // 3. wait for VIDEO_CONFIG (csd-0). CLIENT_CONFIG may
+                //    interleave; SCREEN_OFF means no VIDEO_CONFIG is coming.
                 var csd0: ByteArray? = null
                 var screenOff = false
                 while (csd0 == null && !screenOff) {
@@ -229,11 +225,7 @@ class PenflowClient(
                     }
                 }
 
-                // 4. start the decoder once we have a Surface to render to.
-                //    In screen_off mode we skip this entirely — no video is
-                //    coming, so there's nothing to decode and no need to
-                //    block waiting for a Surface (the activity will hide
-                //    the SurfaceView in response to the CLIENT_CONFIG).
+                // 4. start the decoder, unless screen_off (no video coming).
                 val dec: VideoDecoder? = if (screenOff) {
                     Log.i(TAG, "screen_off — skipping decoder, panel is input-only")
                     null
@@ -290,9 +282,7 @@ class PenflowClient(
             when (type) {
                 Protocol.MSG_VIDEO_FRAME -> {
                     if (dec == null) {
-                        // screen_off mode — server shouldn't be sending video
-                        // frames in this state; log once if it happens so we
-                        // notice protocol drift.
+                        // No decoder in screen_off mode; protocol drift if hit.
                         Log.w(TAG, "VIDEO_FRAME arrived in screen_off mode; dropping (${payload.size} bytes)")
                         continue
                     }

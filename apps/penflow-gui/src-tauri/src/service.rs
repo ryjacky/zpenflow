@@ -334,11 +334,9 @@ fn log_diagnostic(msg: &str) {
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
     let s = settings.read().expect("settings poisoned").clone();
 
-    // Disable any leftover VDD before picking a capture monitor in
-    // Duplicate mode. The MSI's devcon step enables VDD at install
-    // (see installer/wxs/vdd-install.wxs), and a force-killed Extend
-    // session can also leave it on — the dead virtual monitor would
-    // otherwise steal the pen target.
+    // MSI install enables VDD by default (installer/wxs/vdd-install.wxs);
+    // a force-killed Extend session can also leave it on. In Duplicate
+    // disable it so the leftover virtual monitor doesn't steal the pen.
     if matches!(s.topology, settings::TopologyMode::Duplicate) {
         let leftover_vdd = Engine::list_monitors()
             .map(|ms| {
@@ -366,9 +364,8 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         }
     }
 
-    // Pick monitor: first attached non-software output. In Duplicate also
-    // skip virtual ones so the pen still targets a real monitor when the
-    // VDD-disable above failed (e.g. UAC denied).
+    // In Duplicate also skip virtual monitors (belt + suspenders for the
+    // VDD-disable above; if UAC was denied we still pen-target a real one).
     let monitors = Engine::list_monitors().unwrap_or_default();
     let attached = if matches!(s.topology, settings::TopologyMode::Duplicate) {
         monitors
@@ -425,9 +422,7 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         vdd,
         vdd_target_resolution,
         hud_enabled: s.hud_enabled,
-        // Only honour screen_off in Duplicate — blanking the only display
-        // showing the VDD desktop is pointless, and this gate also stops
-        // a stale `screen_off: true` from lighting after a topology flip.
+        // Screen-off only makes sense in Duplicate.
         screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
     }
