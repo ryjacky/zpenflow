@@ -96,6 +96,19 @@ async fn stop_service(state: tauri::State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Force the accept-loop to tear down and re-bind. Surfaced as a
+/// "Reconnect" button because the bound adb-reverse tunnel can silently
+/// disappear under the GUI (adb-server restart, USB cycle, device
+/// transitioning unauthorized→device after the user approved the prompt
+/// late) — the listener still says "Listening" but no Android client can
+/// reach `localabstract:penflow` any more.
+#[tauri::command]
+async fn reconnect_service(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.service.stop().await;
+    state.service.start().await;
+    Ok(())
+}
+
 #[tauri::command]
 fn is_elevated() -> bool {
     os::is_elevated()
@@ -341,6 +354,7 @@ fn main() -> std::process::ExitCode {
             get_status,
             start_service,
             stop_service,
+            reconnect_service,
             is_elevated,
             relaunch_as_admin,
             is_vdd_installed,

@@ -566,6 +566,10 @@ export default function App() {
         else                          await invoke("stop_service");
     }, []);
 
+    const onReconnect = useCallback(async () => {
+        await invoke("reconnect_service");
+    }, []);
+
     if (!settings) {
         return (
             <div className={styles.root}>
@@ -799,6 +803,13 @@ export default function App() {
 
             <footer className={styles.footer}>
                 <span className={styles.saveStatus}>{saveMsg}</span>
+                <Button
+                    onClick={onReconnect}
+                    disabled={isPaused}
+                    title="Tear down and re-bind the adb-reverse tunnel. Use if the tablet says disconnected while Penflow shows Listening — adb sessions can silently drop after a USB cycle or device-authorization change."
+                >
+                    Reconnect
+                </Button>
                 <Button onClick={onToggle}>{isPaused ? "Resume" : "Pause"}</Button>
                 <Button appearance="primary" onClick={onSave}>Save</Button>
             </footer>
