@@ -52,6 +52,10 @@ pub struct Settings {
     /// skips the VDD and captures the primary monitor directly.
     #[serde(default)]
     pub topology: TopologyMode,
+    /// Pen-tablet screen-off mode (Duplicate topology only). Panel dark,
+    /// capture+encode skipped; pen + touch still flow.
+    #[serde(default)]
+    pub screen_off: bool,
 }
 
 fn default_hud_enabled() -> bool {
@@ -70,6 +74,7 @@ impl Default for Settings {
             run_as_admin: false,
             hud_enabled: default_hud_enabled(),
             topology: TopologyMode::default(),
+            screen_off: false,
         }
     }
 }

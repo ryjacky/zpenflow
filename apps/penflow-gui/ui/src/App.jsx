@@ -708,6 +708,24 @@ export default function App() {
                                 Streaming your primary monitor directly. The virtual-display driver and resolution settings are bypassed in this mode.
                             </Caption1>
                         )}
+                        {(settings.topology ?? "extend") === "duplicate" && (
+                            <>
+                                <div className={styles.row}>
+                                    <span className={styles.rowLabel} title="Pen-tablet mode: tablet panel goes dark, capture/encode is skipped on the PC, and pen + touch still draw on your primary monitor like a Wacom Intuos. Saves CPU/GPU and tablet battery. Takes effect after the next reconnect.">
+                                        Screen off (pen tablet only)
+                                    </span>
+                                    <Switch
+                                        checked={settings.screen_off === true}
+                                        onChange={(_, d) => setSettings({ ...settings, screen_off: d.checked })}
+                                    />
+                                </div>
+                                {settings.screen_off === true && (
+                                    <Caption1 className={styles.hint}>
+                                        No video is sent — the encoder and capture pipeline are stopped. Pen and touch still work; the tablet behaves like an input-only Wacom Intuos.
+                                    </Caption1>
+                                )}
+                            </>
+                        )}
                         <Field label="Codec" orientation="horizontal" className={styles.row}>
                             <Dropdown
                                 value={settings.codec === "hevc" ? "HEVC" : "H.264"}
