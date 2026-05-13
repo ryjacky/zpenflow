@@ -704,9 +704,20 @@ export default function App() {
                             </Dropdown>
                         </Field>
                         {(settings.topology ?? "extend") === "duplicate" && (
-                            <Caption1 className={styles.hint}>
-                                Streaming your primary monitor directly. The virtual-display driver and resolution settings are bypassed in this mode.
-                            </Caption1>
+                            <>
+                                <Caption1 className={styles.hint}>
+                                    Streaming your primary monitor directly. The virtual-display driver and resolution settings are bypassed in this mode.
+                                </Caption1>
+                                <div className={styles.row}>
+                                    <span className={styles.rowLabel} title="Drop multi-finger / palm touch events. Pen input is unaffected. Useful in Duplicate mode where your hand resting on the tablet would otherwise click your primary desktop.">
+                                        Disable hand gesture
+                                    </span>
+                                    <Switch
+                                        checked={settings.disable_hand_gestures === true}
+                                        onChange={(_, d) => setSettings({ ...settings, disable_hand_gestures: d.checked })}
+                                    />
+                                </div>
+                            </>
                         )}
                         {(settings.topology ?? "extend") === "duplicate" && (
                             <>

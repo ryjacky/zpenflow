@@ -416,6 +416,13 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         .as_ref()
         .map(|_| (s.vdd_resolution.width, s.vdd_resolution.height));
 
+    // Hand-gesture suppression is exposed as a Duplicate-mode-only switch
+    // in the GUI; enforce that here so a stale flag in settings.json
+    // (left over from a previous Duplicate run) doesn't silently disable
+    // touch in Extend mode where the user can't see the toggle.
+    let disable_hand_gestures =
+        matches!(s.topology, settings::TopologyMode::Duplicate) && s.disable_hand_gestures;
+
     SessionConfig {
         monitor: attached,
         codec: s.codec.into(),
@@ -431,6 +438,7 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         // mode would leave the user with no view of the VDD desktop.
         screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
+        disable_hand_gestures,
     }
 }
 

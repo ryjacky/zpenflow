@@ -56,6 +56,12 @@ pub struct Settings {
     /// capture+encode skipped; pen + touch still flow.
     #[serde(default)]
     pub screen_off: bool,
+    /// Only honoured when `topology` is `Duplicate`: drop incoming touch
+    /// frames before they reach the synthetic-pointer injector. Lets users
+    /// who mirror onto their primary monitor avoid accidental palm/finger
+    /// gestures while their hand rests on the tablet.
+    #[serde(default)]
+    pub disable_hand_gestures: bool,
 }
 
 fn default_hud_enabled() -> bool {
@@ -75,6 +81,7 @@ impl Default for Settings {
             hud_enabled: default_hud_enabled(),
             topology: TopologyMode::default(),
             screen_off: false,
+            disable_hand_gestures: false,
         }
     }
 }

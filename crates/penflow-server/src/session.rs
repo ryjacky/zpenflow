@@ -154,6 +154,12 @@ pub struct SessionConfig {
     /// in `service.rs::build_session_config` so the saved bindings
     /// actually reach the synthetic-pointer layer (issue #6).
     pub pen_profile: penflow_core::inject::binding::PenButtonProfile,
+    /// Drop incoming `MSG_TOUCH_EVENT` frames before they reach the
+    /// injector. Set by the GUI when the user is in Duplicate mode and
+    /// has opted out of hand gestures (their palm/fingers would otherwise
+    /// fire spurious touches on the mirrored primary monitor). Pen events
+    /// are unaffected.
+    pub disable_hand_gestures: bool,
 }
 
 impl Default for SessionConfig {
@@ -207,6 +213,7 @@ impl Default for SessionConfig {
             hud_enabled: true,
             screen_off: false,
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
+            disable_hand_gestures: false,
         }
     }
 }
@@ -617,6 +624,7 @@ impl Session {
             android.display_height,
             idr_tx,
             session_start,
+            self.cfg.disable_hand_gestures,
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
@@ -800,6 +808,7 @@ impl Session {
             android.display_height,
             idr_tx,
             session_start,
+            self.cfg.disable_hand_gestures,
         )
         .await;
 
@@ -971,6 +980,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
     android_h: u16,
     idr_tx: tokio::sync::mpsc::UnboundedSender<()>,
     session_start: Instant,
+    disable_hand_gestures: bool,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
     loop {
@@ -1009,6 +1019,13 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 }
             }
             MSG_TOUCH_EVENT => {
+                // User opted out of hand gestures (typically in Duplicate
+                // mode, where their palm rests on the same monitor they're
+                // mirroring). `read_frame` has already consumed the bytes,
+                // so dropping here is safe — no need to decode.
+                if disable_hand_gestures {
+                    continue;
+                }
                 let te = TouchEvent::decode(&payload)?;
                 let snapshot: Vec<TouchPoint> = te
                     .contacts
