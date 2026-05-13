@@ -334,14 +334,57 @@ fn log_diagnostic(msg: &str) {
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
     let s = settings.read().expect("settings poisoned").clone();
 
-    // Pick monitor: first attached non-software output, or a stub when
-    // VDD is taking over (`Session::run` ignores the field in that case).
+    // Duplicate captures the user's primary monitor directly, so the
+    // bundled VDD virtual display should not be attached. Disable it if
+    // a previous Extend session (or the MSI installer, which enables it
+    // by default — see installer/wxs/vdd-install.wxs) left it on.
+    // Without this, the user sees a phantom second monitor AND the
+    // `attached` selection below could pick the VDD as the capture
+    // target instead of the real primary.
+    if matches!(s.topology, settings::TopologyMode::Duplicate) {
+        let leftover_vdd = Engine::list_monitors()
+            .map(|ms| {
+                ms.into_iter()
+                    .any(|m| m.attached_to_desktop && m.looks_virtual)
+            })
+            .unwrap_or(false);
+        if leftover_vdd {
+            eprintln!(
+                "[service] Duplicate mode — leftover VDD attached, disabling so pen targets a real monitor"
+            );
+            match VddController::detect() {
+                Ok(Some(mut ctrl)) => {
+                    if let Err(e) = ctrl.disable() {
+                        eprintln!("[service] VDD disable failed: {e} (continuing)");
+                    } else {
+                        eprintln!("[service] VDD disabled");
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("[service] no VDD controller found despite virtual monitor present — proceeding anyway");
+                }
+                Err(e) => eprintln!("[service] VDD detect failed: {e} (continuing)"),
+            }
+        }
+    }
+
+    // In Duplicate, exclude virtual monitors from selection. Normally
+    // redundant after the disable above, but kept as a fallback for
+    // when that failed (UAC denied, no controller found).
     let monitors = Engine::list_monitors().unwrap_or_default();
-    let attached = monitors
-        .iter()
-        .find(|m| m.attached_to_desktop && !m.adapter_is_software)
-        .cloned()
-        .unwrap_or_else(|| monitors.first().cloned().unwrap_or_else(stub_monitor));
+    let attached = if matches!(s.topology, settings::TopologyMode::Duplicate) {
+        monitors
+            .iter()
+            .find(|m| m.attached_to_desktop && !m.adapter_is_software && !m.looks_virtual)
+            .cloned()
+            .unwrap_or_else(|| monitors.first().cloned().unwrap_or_else(stub_monitor))
+    } else {
+        monitors
+            .iter()
+            .find(|m| m.attached_to_desktop && !m.adapter_is_software)
+            .cloned()
+            .unwrap_or_else(|| monitors.first().cloned().unwrap_or_else(stub_monitor))
+    };
 
     // Best-effort VDD detection. If it fails or isn't installed, we fall
     // back to capturing whatever physical monitor was selected. Duplicate
@@ -384,6 +427,9 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         vdd,
         vdd_target_resolution,
         hud_enabled: s.hud_enabled,
+        // Screen-off requires Duplicate — blanking the tablet in Extend
+        // mode would leave the user with no view of the VDD desktop.
+        screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
     }
 }

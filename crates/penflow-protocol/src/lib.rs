@@ -273,6 +273,10 @@ impl HelloAndroid {
 /// New flag bits MUST be additive (default-off), so an older client
 /// that ignores them keeps working.
 pub const CLIENT_CFG_FLAG_HUD: u32 = 1 << 0;
+/// Bit 1 = screen off (pen tablet only). No `MSG_VIDEO_CONFIG` /
+/// `MSG_VIDEO_FRAME` will arrive; client should blank the panel and
+/// drop the decoder. Pen + touch still flow.
+pub const CLIENT_CFG_FLAG_SCREEN_OFF: u32 = 1 << 1;
 
 /// `MSG_CLIENT_CONFIG` payload. Currently a single u32 of preference
 /// flags. Kept fixed-width so future fields can be appended after it
@@ -312,6 +316,11 @@ impl ClientConfig {
     /// Convenience: is HUD bit set?
     pub fn hud_enabled(&self) -> bool {
         self.flags & CLIENT_CFG_FLAG_HUD != 0
+    }
+
+    /// Is the screen-off bit set?
+    pub fn screen_off(&self) -> bool {
+        self.flags & CLIENT_CFG_FLAG_SCREEN_OFF != 0
     }
 }
 

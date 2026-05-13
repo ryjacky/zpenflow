@@ -34,6 +34,11 @@ class MainActivity : Activity() {
     @Volatile
     private var activeRect: Rect = Rect()
 
+    /** Mirrors the PC's CLIENT_CONFIG SCREEN_OFF bit. Sticky per
+     *  session; re-evaluated on reconnect. */
+    @Volatile
+    private var screenOff: Boolean = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -107,6 +112,14 @@ class MainActivity : Activity() {
                     // Views but conceptually one "instrumentation overlay".
                     hud.visibility = vis
                     statusView.visibility = vis
+
+                    // Screen-off: hide the video surface and dim the panel
+                    // (no video will arrive). Pen + touch input still flow.
+                    screenOff = cfg.screenOff
+                    surfaceView.visibility =
+                        if (cfg.screenOff) android.view.View.GONE
+                        else android.view.View.VISIBLE
+                    applyScreenBrightness(cfg.screenOff)
                 }
             },
         )
@@ -146,11 +159,35 @@ class MainActivity : Activity() {
         statusView.text = when (st) {
             PenflowClient.State.Disconnected -> "disconnected"
             PenflowClient.State.Connecting -> "connecting…"
-            is PenflowClient.State.Connected -> "connected ${st.width}x${st.height}@${st.fps}"
+            is PenflowClient.State.Connected -> if (screenOff)
+                "pen tablet — display off (${st.width}x${st.height} target)"
+            else
+                "connected ${st.width}x${st.height}@${st.fps}"
             is PenflowClient.State.Error -> "error: ${st.message}"
         }
         if (st is PenflowClient.State.Connected) {
+            // Run the contain layout in both modes so activeRect preserves
+            // the target monitor's aspect ratio — otherwise pen strokes
+            // would be stretched in screen_off when panel and monitor
+            // aspects differ. SurfaceView resize is a no-op when GONE.
+            // TODO: expose a "Mapping" setting in the GUI (aspect-fit /
+            // stretch / custom rect) so power users can pick.
             applyContainLayout(st.width, st.height)
+        }
+    }
+
+    /** Per-window brightness override; no WRITE_SETTINGS needed. */
+    private fun applyScreenBrightness(dim: Boolean) {
+        val lp = window.attributes
+        val target = if (dim) {
+            WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_OFF
+        } else {
+            WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        }
+        if (lp.screenBrightness != target) {
+            lp.screenBrightness = target
+            window.attributes = lp
+            Log.i(TAG, "screen_off=$dim — brightness override = $target")
         }
     }
 

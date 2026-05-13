@@ -199,12 +199,11 @@ class PenflowClient(
                 val hello = Protocol.decodeHelloPc(helloPayload)
                 Log.i(TAG, "HELLO_PC ${hello.width}x${hello.height}@${hello.fps} codec=${hello.codec}")
 
-                // 3. wait for VIDEO_CONFIG (csd-0). The server may interleave
-                //    other one-shot messages here — currently CLIENT_CONFIG —
-                //    so handle the known ones inline and only warn for truly
-                //    unexpected ids.
+                // 3. wait for VIDEO_CONFIG (csd-0). CLIENT_CONFIG may
+                //    interleave; SCREEN_OFF means no VIDEO_CONFIG is coming.
                 var csd0: ByteArray? = null
-                while (csd0 == null) {
+                var screenOff = false
+                while (csd0 == null && !screenOff) {
                     val (type, payload) = Protocol.recvMsg(input)
                     when (type) {
                         Protocol.MSG_VIDEO_CONFIG -> {
@@ -213,7 +212,8 @@ class PenflowClient(
                         Protocol.MSG_CLIENT_CONFIG -> {
                             try {
                                 val cfg = Protocol.decodeClientConfig(payload)
-                                Log.i(TAG, "CLIENT_CONFIG (handshake) flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled}")
+                                Log.i(TAG, "CLIENT_CONFIG (handshake) flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled} screen_off=${cfg.screenOff}")
+                                if (cfg.screenOff) screenOff = true
                                 onClientConfig?.invoke(cfg)
                             } catch (e: Exception) {
                                 Log.w(TAG, "CLIENT_CONFIG decode failed: $e (ignoring)")
@@ -225,14 +225,20 @@ class PenflowClient(
                     }
                 }
 
-                // 4. start the decoder once we have a Surface to render to
-                val surface = waitForSurface()
-                val dec = VideoDecoder(
-                    hello.width, hello.height, hello.fps, hello.codec, surface, csd0!!,
-                    onDecoded = { framePtsNs, decodedNs -> onDecoderFrameDone(framePtsNs, decodedNs) },
-                )
-                dec.start()
-                decoder = dec
+                // 4. start the decoder, unless screen_off (no video coming).
+                val dec: VideoDecoder? = if (screenOff) {
+                    Log.i(TAG, "screen_off — skipping decoder, panel is input-only")
+                    null
+                } else {
+                    val surface = waitForSurface()
+                    VideoDecoder(
+                        hello.width, hello.height, hello.fps, hello.codec, surface, csd0!!,
+                        onDecoded = { framePtsNs, decodedNs -> onDecoderFrameDone(framePtsNs, decodedNs) },
+                    ).also {
+                        it.start()
+                        decoder = it
+                    }
+                }
                 onState(State.Connected(hello.width, hello.height, hello.fps))
 
                 // 5. read frames forever (this is the session lifetime —
@@ -270,11 +276,16 @@ class PenflowClient(
         error("timed out waiting for output Surface")
     }
 
-    private suspend fun readLoop(input: DataInputStream, dec: VideoDecoder) {
+    private suspend fun readLoop(input: DataInputStream, dec: VideoDecoder?) {
         while (true) {
             val (type, payload) = Protocol.recvMsg(input)
             when (type) {
                 Protocol.MSG_VIDEO_FRAME -> {
+                    if (dec == null) {
+                        // No decoder in screen_off mode; protocol drift if hit.
+                        Log.w(TAG, "VIDEO_FRAME arrived in screen_off mode; dropping (${payload.size} bytes)")
+                        continue
+                    }
                     val recvNs = System.nanoTime()
                     val header = Protocol.decodeVideoFrame(payload)
                     // Record sample BEFORE feeding the decoder — the codec
@@ -300,7 +311,7 @@ class PenflowClient(
                 Protocol.MSG_CLIENT_CONFIG -> {
                     try {
                         val cfg = Protocol.decodeClientConfig(payload)
-                        Log.i(TAG, "CLIENT_CONFIG flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled}")
+                        Log.i(TAG, "CLIENT_CONFIG flags=0x${"%08x".format(cfg.flags)} hud=${cfg.hudEnabled} screen_off=${cfg.screenOff}")
                         onClientConfig?.invoke(cfg)
                     } catch (e: Exception) {
                         Log.w(TAG, "CLIENT_CONFIG decode failed: $e (ignoring)")
