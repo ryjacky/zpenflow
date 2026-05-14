@@ -56,6 +56,15 @@ pub struct Settings {
     /// capture+encode skipped; pen + touch still flow.
     #[serde(default)]
     pub screen_off: bool,
+    /// Wireless ADB configuration. When `enabled`, the service calls
+    /// `adb connect <host>:<port>` before binding the reverse tunnel
+    /// so the tablet can connect over Wi-Fi instead of USB. Pairing
+    /// (`adb pair`) is handled on-demand by the GUI Wireless panel
+    /// and is not persisted — the tablet stores the host's ed25519
+    /// key after pairing once, and subsequent connects just need the
+    /// host and connect port.
+    #[serde(default)]
+    pub wireless: WirelessConfig,
 }
 
 fn default_hud_enabled() -> bool {
@@ -75,8 +84,32 @@ impl Default for Settings {
             hud_enabled: default_hud_enabled(),
             topology: TopologyMode::default(),
             screen_off: false,
+            wireless: WirelessConfig::default(),
         }
     }
+}
+
+/// On-disk shape of the wireless ADB section. Defaults to disabled so
+/// existing settings.json files pre-wireless deserialize unchanged and
+/// continue to use the USB-only flow.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WirelessConfig {
+    /// Master toggle. When `false`, the service ignores every other
+    /// field in this struct and uses the plain USB-attached ADB
+    /// daemon path.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Tablet IP / hostname. Populated by the GUI from the *Wireless
+    /// debugging* screen on the tablet — usually the LAN IP like
+    /// `192.168.1.42`. Empty string when never configured.
+    #[serde(default)]
+    pub host: String,
+    /// TCP port on the tablet for the *connect* transport (NOT the
+    /// pair port). Android picks this; the *Wireless debugging* screen
+    /// shows it after pairing succeeds. Stored as `u16` so values
+    /// outside the legal port range can't round-trip.
+    #[serde(default)]
+    pub port: u16,
 }
 
 /// VDD-on (Extend) vs. VDD-off (Duplicate). See `Settings::topology`.
@@ -153,7 +186,29 @@ impl DisplayResolution {
 }
 
 pub fn validate(s: &Settings) -> Result<(), String> {
-    s.vdd_resolution.validate()
+    s.vdd_resolution.validate()?;
+    s.wireless.validate()
+}
+
+impl WirelessConfig {
+    /// Reject obviously-broken wireless setups before we try to drive
+    /// adb with them. We don't sanity-check the host string against
+    /// DNS — adb itself will error on that — but a zero port or
+    /// empty host while `enabled` is the kind of mistake that's worth
+    /// catching at save time so the user can see the error in the
+    /// settings panel instead of in a debug log.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.host.trim().is_empty() {
+            return Err("wireless host is required when wireless is enabled".into());
+        }
+        if self.port == 0 {
+            return Err("wireless port is required when wireless is enabled".into());
+        }
+        Ok(())
+    }
 }
 
 /// Local serializable shadow of `penflow_core::encoder::Codec`. Wrapper
@@ -383,6 +438,52 @@ mod tests {
         });
         assert!(xml.contains("<width>1920</width>"));
         assert!(xml.contains("<height>1200</height>"));
+    }
+
+    #[test]
+    fn wireless_disabled_doesnt_validate_fields() {
+        let s = Settings {
+            wireless: WirelessConfig {
+                enabled: false,
+                host: String::new(),
+                port: 0,
+            },
+            ..Settings::default()
+        };
+        validate(&s).expect("disabled wireless should be valid regardless of fields");
+    }
+
+    #[test]
+    fn wireless_enabled_requires_host_and_port() {
+        let s = Settings {
+            wireless: WirelessConfig {
+                enabled: true,
+                host: String::new(),
+                port: 0,
+            },
+            ..Settings::default()
+        };
+        assert!(validate(&s).is_err());
+
+        let s = Settings {
+            wireless: WirelessConfig {
+                enabled: true,
+                host: "192.168.1.42".into(),
+                port: 0,
+            },
+            ..Settings::default()
+        };
+        assert!(validate(&s).is_err());
+
+        let s = Settings {
+            wireless: WirelessConfig {
+                enabled: true,
+                host: "192.168.1.42".into(),
+                port: 5555,
+            },
+            ..Settings::default()
+        };
+        validate(&s).expect("fully-specified wireless should validate");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use tauri::{
     Emitter, Manager, WindowEvent,
 };
 
-use crate::service::{Service, ServiceState};
+use crate::service::{bundled_or_path_adb, Service, ServiceState};
 use crate::settings::{Settings, SharedSettings};
 
 struct AppState {
@@ -193,6 +193,76 @@ async fn install_vdd(
     settings::write_installed_vdd_settings(&s)
         .map_err(|e| format!("VDD settings write failed: {e}"))?;
     Ok(())
+}
+
+/// Run `adb pair <host>:<port> <code>` so the GUI's wireless panel can
+/// drive the one-time Android-11+ pairing flow. Returns adb's stdout
+/// on success so the panel can show e.g. `"Successfully paired to
+/// 192.168.1.42:39855 [guid=…]"`.
+#[tauri::command]
+async fn adb_pair(host: String, port: u16, code: String) -> Result<String, String> {
+    let adb_path = bundled_or_path_adb();
+    penflow_transport::wireless::pair(&adb_path, &host, port, &code)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Run `adb connect <host>:<port>` against the tablet. The Wireless
+/// panel uses this both for an ad-hoc connect-test (so the user can
+/// confirm the address is reachable before enabling wireless mode) and
+/// implicitly via the service when wireless mode is enabled. Surfaces
+/// adb's status line ("connected to …", "already connected to …") on
+/// success and the textual failure reason on error.
+#[tauri::command]
+async fn adb_connect(host: String, port: u16) -> Result<String, String> {
+    let adb_path = bundled_or_path_adb();
+    penflow_transport::wireless::connect(&adb_path, &host, port)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Run `adb disconnect <host>:<port>`. Idempotent — adb returns 0 even
+/// when the endpoint wasn't connected. Used by the Wireless panel's
+/// explicit disconnect button.
+#[tauri::command]
+async fn adb_disconnect(host: String, port: u16) -> Result<(), String> {
+    let adb_path = bundled_or_path_adb();
+    penflow_transport::wireless::disconnect(&adb_path, &host, port)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Run `adb devices -l` and return parsed rows. The Wireless panel
+/// shows this so the user can confirm the tablet appears as a wireless
+/// transport (serial = `host:port`, state = `device`) after a connect.
+#[tauri::command]
+async fn adb_list_devices() -> Result<Vec<AdbDeviceDto>, String> {
+    let adb_path = bundled_or_path_adb();
+    let devs = penflow_transport::wireless::list_devices(&adb_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(devs.into_iter().map(AdbDeviceDto::from).collect())
+}
+
+/// JSON-friendly shadow of `penflow_transport::wireless::AdbDevice`.
+/// Defined here (rather than serde-deriving on the transport struct)
+/// to avoid forcing serde into the transport crate just for the GUI's
+/// IPC layer.
+#[derive(Clone, Debug, serde::Serialize)]
+struct AdbDeviceDto {
+    serial: String,
+    state: String,
+    is_wireless: bool,
+}
+
+impl From<penflow_transport::wireless::AdbDevice> for AdbDeviceDto {
+    fn from(d: penflow_transport::wireless::AdbDevice) -> Self {
+        Self {
+            serial: d.serial,
+            state: d.state,
+            is_wireless: d.is_wireless,
+        }
+    }
 }
 
 /// Restore + focus the main window after a tray click or the "Show"
@@ -397,6 +467,10 @@ fn main() -> std::process::ExitCode {
             install_vdd,
             is_vmulti_installed,
             install_vmulti,
+            adb_pair,
+            adb_connect,
+            adb_disconnect,
+            adb_list_devices,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Penflow GUI");

@@ -22,6 +22,7 @@ use penflow_core::inject::binding::{Binding as CoreBinding, MouseButtonKind, Pen
 use penflow_core::Engine;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
+use penflow_transport::wireless;
 use penflow_transport::Transport;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT,
@@ -160,8 +161,63 @@ impl Service {
             let adb_path = bundled_or_path_adb();
             eprintln!("[service] preparing — adb at '{adb_path}'");
 
+            // When wireless is enabled, run `adb connect <host>:<port>`
+            // first. The reverse-tunnel transport below works the same
+            // way regardless of USB vs Wi-Fi once the device is
+            // registered with the daemon, so this is the entire
+            // wireless-mode delta. We don't loop pair here — pairing is
+            // a one-time GUI action surfaced via the `adb_pair` Tauri
+            // command; the service-loop runs only the per-launch
+            // `connect` call.
+            let target_serial: Option<String> = {
+                let wcfg = self
+                    .settings
+                    .read()
+                    .expect("settings poisoned")
+                    .wireless
+                    .clone();
+                if wcfg.enabled {
+                    eprintln!(
+                        "[service] wireless: adb connect {}:{}",
+                        wcfg.host, wcfg.port
+                    );
+                    match wireless::connect(&adb_path, &wcfg.host, wcfg.port).await {
+                        Ok(msg) => eprintln!("[service] wireless connect ok: {msg}"),
+                        Err(e) => {
+                            let full = format!("wireless adb connect failed: {e}");
+                            eprintln!("[service] {full}");
+                            log_diagnostic(&full);
+                            self.emit(ServiceState::Error { message: full }).await;
+                            // Connect failures are usually "tablet
+                            // unreachable on the LAN" — retry with the
+                            // same short backoff used for transient
+                            // bind errors so unplugging the tablet
+                            // briefly doesn't permanently park the
+                            // service.
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                                _ = &mut cancel => return,
+                            }
+                        }
+                    }
+                    // Pass the wireless serial to `adb reverse` so
+                    // multi-transport setups (e.g. mDNS-discovered TLS
+                    // transport alongside the plain TCP one we just
+                    // dialed) don't trip "more than one device/emulator".
+                    Some(format!("{}:{}", wcfg.host, wcfg.port))
+                } else {
+                    None
+                }
+            };
+
             let transport: Arc<dyn Transport> =
-                match AdbLocalAbstractTransport::bind_with_adb("penflow", adb_path).await {
+                match AdbLocalAbstractTransport::bind_with_adb_targeting(
+                    "penflow",
+                    adb_path,
+                    target_serial,
+                )
+                .await
+                {
                     Ok(t) => {
                         eprintln!("[service] adb reverse OK; bound port={}", t.bound_port());
                         self.emit(ServiceState::Listening).await;
@@ -292,7 +348,7 @@ fn translate_event(ev: SessionEvent) -> ServiceState {
 ///      manually deleted Penflow's adb folder. The transport crate's
 ///      `resolve_through_shim` then handles scoop-style indirection
 ///      if applicable.
-fn bundled_or_path_adb() -> String {
+pub(crate) fn bundled_or_path_adb() -> String {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let bundled = dir.join("adb").join("adb.exe");

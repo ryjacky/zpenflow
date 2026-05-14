@@ -6,6 +6,7 @@ import {
     Option,
     SpinButton,
     Field,
+    Input,
     Text,
     Title3,
     Subtitle2,
@@ -241,6 +242,41 @@ const useStyles = makeStyles({
         marginTop: "-4px",
         marginBottom: "8px",
     },
+    // ----- Wireless panel -----
+    wirelessGrid: {
+        display: "grid",
+        gridTemplateColumns: "minmax(0, 1fr) 96px",
+        columnGap: "8px",
+        rowGap: "10px",
+        alignItems: "center",
+        marginTop: "8px",
+    },
+    wirelessLabel: {
+        color: tokens.colorNeutralForeground1,
+        fontSize: "13px",
+    },
+    wirelessFieldRow: {
+        display: "contents",
+    },
+    wirelessActions: {
+        display: "flex",
+        gap: "8px",
+        flexWrap: "wrap",
+        marginTop: "12px",
+    },
+    wirelessStatus: {
+        marginTop: "10px",
+        fontSize: "12px",
+        color: tokens.colorNeutralForeground3,
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+    },
+    wirelessStatusError: {
+        color: tokens.colorPaletteRedForeground1,
+    },
+    wirelessStatusOk: {
+        color: tokens.colorPaletteGreenForeground1,
+    },
 });
 
 const MOD_ORDER = ["Ctrl", "Alt", "Shift", "Win"];
@@ -473,6 +509,205 @@ function BindingRow({ label, slot, onChange, styles }) {
             </div>
             {renderDetail()}
         </div>
+    );
+}
+
+function WirelessPanel({ wireless, onChange, styles }) {
+    // Pair form is ephemeral — never persisted. The tablet stores the
+    // host's ed25519 key after pairing once, so subsequent launches
+    // only need (host, port). We keep `pairHost` defaulting to the
+    // configured connect host because the connect IP and pair IP are
+    // identical on every Android build we've seen; the pair PORT is
+    // different and the user must read it off the tablet each time.
+    const [pairHost, setPairHost] = useState(wireless.host || "");
+    const [pairPort, setPairPort] = useState("");
+    const [pairCode, setPairCode] = useState("");
+    const [statusMsg, setStatusMsg] = useState("");
+    const [statusKind, setStatusKind] = useState("info"); // info|ok|error
+    const [busy, setBusy] = useState(null); // null | "pair" | "connect" | "disconnect" | "list"
+
+    const setStatus = (msg, kind = "info") => {
+        setStatusMsg(msg);
+        setStatusKind(kind);
+    };
+
+    const runPair = useCallback(async () => {
+        if (!pairHost || !pairPort || !pairCode) {
+            setStatus("Pair requires host, pair port, and 6-digit code", "error");
+            return;
+        }
+        setBusy("pair");
+        setStatus("pairing…");
+        try {
+            const out = await invoke("adb_pair", {
+                host: pairHost.trim(),
+                port: Number(pairPort),
+                code: pairCode.trim(),
+            });
+            setStatus(out || "Paired", "ok");
+            setPairCode("");
+        } catch (e) {
+            setStatus(String(e), "error");
+        } finally {
+            setBusy(null);
+        }
+    }, [pairHost, pairPort, pairCode]);
+
+    const runConnect = useCallback(async () => {
+        if (!wireless.host || !wireless.port) {
+            setStatus("Connect requires host and port", "error");
+            return;
+        }
+        setBusy("connect");
+        setStatus("connecting…");
+        try {
+            const out = await invoke("adb_connect", {
+                host: wireless.host.trim(),
+                port: Number(wireless.port),
+            });
+            setStatus(out || "Connected", "ok");
+        } catch (e) {
+            setStatus(String(e), "error");
+        } finally {
+            setBusy(null);
+        }
+    }, [wireless.host, wireless.port]);
+
+    const runDisconnect = useCallback(async () => {
+        if (!wireless.host || !wireless.port) return;
+        setBusy("disconnect");
+        setStatus("disconnecting…");
+        try {
+            await invoke("adb_disconnect", {
+                host: wireless.host.trim(),
+                port: Number(wireless.port),
+            });
+            setStatus("Disconnected", "ok");
+        } catch (e) {
+            setStatus(String(e), "error");
+        } finally {
+            setBusy(null);
+        }
+    }, [wireless.host, wireless.port]);
+
+    const runList = useCallback(async () => {
+        setBusy("list");
+        setStatus("listing…");
+        try {
+            const devs = await invoke("adb_list_devices");
+            if (!devs.length) {
+                setStatus("No devices visible to adb.", "info");
+            } else {
+                const lines = devs.map(
+                    (d) => `${d.is_wireless ? "wifi" : "usb "}  ${d.serial}  ${d.state}`,
+                );
+                setStatus(lines.join("\n"), "ok");
+            }
+        } catch (e) {
+            setStatus(String(e), "error");
+        } finally {
+            setBusy(null);
+        }
+    }, []);
+
+    const statusClass = (() => {
+        const base = styles.wirelessStatus;
+        if (statusKind === "error") return base + " " + styles.wirelessStatusError;
+        if (statusKind === "ok") return base + " " + styles.wirelessStatusOk;
+        return base;
+    })();
+
+    return (
+        <section className={styles.card}>
+            <Subtitle2 className={styles.cardTitle}>Wireless ADB</Subtitle2>
+            <Caption1 className={styles.hint}>
+                Connect over Wi-Fi instead of USB. Pair once from <i>Developer options →
+                Wireless debugging → Pair device with pairing code</i> on the tablet, then
+                fill in the connect host and port.
+            </Caption1>
+
+            <div className={styles.row}>
+                <span className={styles.rowLabel}>Use wireless ADB</span>
+                <Switch
+                    checked={wireless.enabled}
+                    onChange={(_, d) => onChange({ ...wireless, enabled: d.checked })}
+                />
+            </div>
+
+            <div className={styles.wirelessGrid}>
+                <Field label="Connect host" orientation="horizontal">
+                    <Input
+                        value={wireless.host}
+                        placeholder="192.168.1.42"
+                        onChange={(_, d) => onChange({ ...wireless, host: d.value })}
+                    />
+                </Field>
+                <Field label="Port" orientation="horizontal">
+                    <SpinButton
+                        value={wireless.port}
+                        min={1}
+                        max={65535}
+                        step={1}
+                        onChange={(_, d) => {
+                            const v = d.value ?? Number(d.displayValue);
+                            if (Number.isFinite(v)) {
+                                onChange({ ...wireless, port: Math.round(v) });
+                            }
+                        }}
+                    />
+                </Field>
+            </div>
+
+            <Subtitle2 className={styles.cardTitle} style={{ marginTop: "18px" }}>
+                Pair (one-time)
+            </Subtitle2>
+            <Caption1 className={styles.hint}>
+                Android shows a separate pair IP:port and a 6-digit code on the pairing
+                screen. The pair port is different from the connect port above.
+            </Caption1>
+            <div className={styles.wirelessGrid}>
+                <Field label="Pair host" orientation="horizontal">
+                    <Input
+                        value={pairHost}
+                        placeholder="192.168.1.42"
+                        onChange={(_, d) => setPairHost(d.value)}
+                    />
+                </Field>
+                <Field label="Pair port" orientation="horizontal">
+                    <Input
+                        value={pairPort}
+                        placeholder="39855"
+                        onChange={(_, d) => setPairPort(d.value.replace(/\D/g, ""))}
+                    />
+                </Field>
+                <Field label="Pairing code" orientation="horizontal">
+                    <Input
+                        value={pairCode}
+                        placeholder="123456"
+                        maxLength={6}
+                        onChange={(_, d) => setPairCode(d.value.replace(/\D/g, ""))}
+                    />
+                </Field>
+                <span />
+            </div>
+
+            <div className={styles.wirelessActions}>
+                <Button onClick={runPair} disabled={busy !== null}>
+                    {busy === "pair" ? <Spinner size="tiny" /> : "Pair"}
+                </Button>
+                <Button onClick={runConnect} disabled={busy !== null}>
+                    {busy === "connect" ? <Spinner size="tiny" /> : "Test connect"}
+                </Button>
+                <Button onClick={runDisconnect} disabled={busy !== null}>
+                    {busy === "disconnect" ? <Spinner size="tiny" /> : "Disconnect"}
+                </Button>
+                <Button onClick={runList} disabled={busy !== null}>
+                    {busy === "list" ? <Spinner size="tiny" /> : "adb devices"}
+                </Button>
+            </div>
+
+            {statusMsg && <pre className={statusClass}>{statusMsg}</pre>}
+        </section>
     );
 }
 
@@ -809,6 +1044,12 @@ export default function App() {
                     </div>
                 </div>
             </section>
+
+            <WirelessPanel
+                wireless={settings.wireless ?? { enabled: false, host: "", port: 5555 }}
+                onChange={(next) => setSettings({ ...settings, wireless: next })}
+                styles={styles}
+            />
 
             <section className={styles.card}>
                 <Subtitle2 className={styles.cardTitle}>Pen buttons</Subtitle2>

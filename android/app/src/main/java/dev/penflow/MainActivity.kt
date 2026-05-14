@@ -1,8 +1,14 @@
 package dev.penflow
 
 import android.app.Activity
+import android.content.Context
 import android.graphics.Rect
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Bundle
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.MotionEvent
@@ -12,6 +18,8 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.TextView
+import java.net.Inet4Address
+import java.net.NetworkInterface
 
 /**
  * Top-level entry. Wires the Surface, the network client, and the pen
@@ -156,7 +164,16 @@ class MainActivity : Activity() {
     }
 
     private fun renderState(st: PenflowClient.State) {
-        statusView.text = when (st) {
+        // Compose a one-line state summary, then unconditionally append
+        // the LAN IP + wireless-debugging port. Showing wireless info
+        // on every state (including Connected) avoids the bug from the
+        // first attempt at this feature: the previous code only
+        // injected wireless info on Disconnected/Error, but in normal
+        // use the app jumps straight from Connecting → Connected and
+        // the info was never visible. The user reads the IP off the
+        // tablet at any time to fill in Penflow's desktop wireless
+        // panel, so making it persistent is the correct trade-off.
+        val state = when (st) {
             PenflowClient.State.Disconnected -> "disconnected"
             PenflowClient.State.Connecting -> "connecting…"
             is PenflowClient.State.Connected -> if (screenOff)
@@ -165,6 +182,7 @@ class MainActivity : Activity() {
                 "connected ${st.width}x${st.height}@${st.fps}"
             is PenflowClient.State.Error -> "error: ${st.message}"
         }
+        statusView.text = withWirelessInfo(state)
         if (st is PenflowClient.State.Connected) {
             // Run the contain layout in both modes so activeRect preserves
             // the target monitor's aspect ratio — otherwise pen strokes
@@ -263,6 +281,176 @@ class MainActivity : Activity() {
             penButtonsCount = buttons,
             codecCaps = MediaCodecCaps.queryHardwareDecodeBitmask(),
         )
+    }
+
+    /**
+     * Append the tablet's LAN IP and (when readable) the wireless-debugging
+     * port to a status string. The user reads these off the tablet panel
+     * and types them into the Penflow desktop GUI's *Wireless* panel.
+     *
+     * The pairing code itself is generated and held inside Android's
+     * system *Wireless debugging → Pair device with pairing code* dialog
+     * — it is intentionally **not** exposed to third-party apps, so we
+     * can't display it here. The IP we surface IS reusable for both the
+     * connect endpoint and the pair endpoint (Android binds them to the
+     * same address); only the ports differ.
+     */
+    private fun withWirelessInfo(prefix: String): String {
+        val (ip, diag) = readLanIpv4WithDiag()
+        val port = readAdbWifiPort()
+        val portFragment = if (port != null) ":$port" else ""
+        val hint = if (port == null) {
+            "(open Settings → Wireless debugging for port + pair code)"
+        } else {
+            "(pair code from Settings → Wireless debugging)"
+        }
+        val line = if (ip != null) {
+            "wifi: $ip$portFragment  $hint"
+        } else {
+            // Surface the diagnostic so we can see WHY lookup failed
+            // without having to plug in adb logcat. This stays visible
+            // until lookup starts working.
+            "wifi: lookup failed — $diag"
+        }
+        return "$prefix\n$line"
+    }
+
+    /**
+     * Return the first non-loopback IPv4 address bound to any active
+     * interface, or `null` if none are up. `NetworkInterface` doesn't
+     * need a manifest permission (unlike `WifiManager.connectionInfo`,
+     * which now needs `ACCESS_FINE_LOCATION` on Android 10+), and it
+     * works on Ethernet-only setups too.
+     */
+    /**
+     * Try every Android API we have for "what is my IPv4 address" and
+     * return the first hit along with a one-line diagnostic when no
+     * strategy worked. We surface the diagnostic in the UI so failures
+     * are visible without `adb logcat`.
+     *
+     * Strategy 1: `ConnectivityManager` — the canonical API. Walks
+     *   all active networks, picks the one with WIFI / ETHERNET /
+     *   anything-but-loopback transport, reads its `LinkProperties.
+     *   linkAddresses` for the first IPv4.
+     *
+     * Strategy 2: `NetworkInterface` enumeration — fallback that
+     *   doesn't need ConnectivityManager and works on some weird OEM
+     *   builds where the CM path returns no LinkAddresses.
+     */
+    private fun readLanIpv4WithDiag(): Pair<String?, String> {
+        val notes = StringBuilder()
+        try {
+            val cm = applicationContext.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as? ConnectivityManager
+            if (cm == null) {
+                notes.append("CM null; ")
+            } else {
+                val networks: Array<Network> = cm.allNetworks
+                if (networks.isEmpty()) notes.append("no networks; ")
+                // Sort by transport preference: WiFi > Ethernet > Cellular > other.
+                val scored = networks.map { n ->
+                    val caps = cm.getNetworkCapabilities(n)
+                    val score = when {
+                        caps == null -> 0
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> 100
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> 90
+                        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> 30
+                        else -> 10
+                    }
+                    Triple(score, n, caps)
+                }.sortedByDescending { it.first }
+                for ((score, net, _) in scored) {
+                    val lp: LinkProperties = cm.getLinkProperties(net) ?: continue
+                    for (la in lp.linkAddresses) {
+                        val a = la.address
+                        if (a is Inet4Address && !a.isLoopbackAddress) {
+                            val host = a.hostAddress
+                            if (host != null) {
+                                Log.i(TAG, "readLanIpv4: CM hit iface=${lp.interfaceName} score=$score addr=$host")
+                                return host to ""
+                            }
+                        }
+                    }
+                }
+                notes.append("CM found no IPv4; ")
+            }
+        } catch (e: Exception) {
+            notes.append("CM exception ${e.javaClass.simpleName}; ")
+            Log.w(TAG, "readLanIpv4: CM path threw", e)
+        }
+
+        // Fallback: NetworkInterface enumeration.
+        try {
+            val ifs = NetworkInterface.getNetworkInterfaces()
+            if (ifs == null) {
+                notes.append("NI null")
+                return null to notes.toString()
+            }
+            val candidates = mutableListOf<Triple<Int, String, String>>()
+            for (iface in ifs.toList()) {
+                val name = iface.name ?: ""
+                val up = try { iface.isUp } catch (_: Exception) { false }
+                val lb = try { iface.isLoopback } catch (_: Exception) { false }
+                if (lb) continue
+                val score = when {
+                    name.startsWith("wlan") -> 100
+                    name.startsWith("eth") -> 90
+                    name.startsWith("rmnet") -> 30
+                    else -> 10
+                }
+                for (addr in iface.inetAddresses.toList()) {
+                    if (addr !is Inet4Address) continue
+                    if (addr.isLoopbackAddress) continue
+                    val host = addr.hostAddress ?: continue
+                    Log.i(TAG, "readLanIpv4: NI candidate iface=$name up=$up score=$score addr=$host")
+                    // Prefer "up" interfaces but don't exclude others —
+                    // on some OEMs wlan0.isUp returns false even with
+                    // a valid bound address.
+                    val effective = score + (if (up) 5 else 0)
+                    candidates += Triple(effective, name, host)
+                }
+            }
+            val pick = candidates.maxByOrNull { it.first }
+            return if (pick != null) {
+                pick.third to ""
+            } else {
+                notes.append("NI no IPv4")
+                null to notes.toString()
+            }
+        } catch (e: Exception) {
+            notes.append("NI exception ${e.javaClass.simpleName}")
+            Log.w(TAG, "readLanIpv4: NI path threw", e)
+            return null to notes.toString()
+        }
+    }
+
+    /**
+     * Best-effort read of the Android 11+ wireless-debugging *connect*
+     * port from `Settings.Global`. The key isn't part of the public SDK
+     * and OEMs are inconsistent: AOSP / Pixel uses `adb_wifi_port`,
+     * other OEMs may use a different key or hide the value. Returns
+     * `null` whenever we can't get a positive integer back, and the
+     * caller falls back to "see system Wireless debugging screen".
+     *
+     * The pair port is deliberately not probed — it's ephemeral, only
+     * exists while the system pairing dialog is open, and isn't
+     * exposed via Settings at all.
+     */
+    private fun readAdbWifiPort(): Int? {
+        // Iterate every plausible vendor key we've seen mentioned in
+        // AOSP, Samsung, and Xiaomi sources. Picking the first
+        // non-zero hit keeps this resilient as OEMs rename.
+        for (key in arrayOf("adb_wifi_port", "wifi_adb_port", "wireless_adb_port")) {
+            try {
+                val v = Settings.Global.getInt(contentResolver, key, -1)
+                if (v in 1..65535) return v
+            } catch (_: Exception) {
+                // Some OEM builds throw SecurityException on unknown
+                // keys instead of returning the default. Swallow and
+                // try the next candidate.
+            }
+        }
+        return null
     }
 
     companion object {

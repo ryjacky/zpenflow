@@ -20,37 +20,14 @@
 //! adds support.
 
 use std::io;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
-
-/// `CREATE_NO_WINDOW` from `wincon.h`. We attach this flag to every
-/// `adb.exe` spawn because the Tauri GUI ships with
-/// `#![windows_subsystem = "windows"]` (no parent console), so any
-/// console child without this flag pops a black `cmd`-like window for
-/// a few hundred milliseconds. With reverse-tunnel rebinding running
-/// 2× per accept-loop iteration, that produced a continuous flicker
-/// — especially on machines without adb installed where every retry
-/// failed and the error path looped fast.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-/// Wrap `Command::new(...)` callers so every adb spawn is silent on
-/// Windows; on other platforms this is a no-op pass-through.
-#[cfg(windows)]
-fn silent(cmd: &mut Command) -> &mut Command {
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(CREATE_NO_WINDOW)
-}
-
-#[cfg(not(windows))]
-fn silent(cmd: &mut Command) -> &mut Command {
-    cmd
-}
 
 use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
+use crate::util::{resolve_through_shim, run_adb, silent};
 use crate::{Transport, TransportStream};
 
 /// Default `localabstract:` name. Must match
@@ -67,6 +44,12 @@ pub struct AdbLocalAbstractTransport {
     bound_port: u16,
     /// `adb` executable path. Lets tests / packaged installers override.
     adb_path: String,
+    /// Device serial to target with `adb -s <serial>`, or `None` to
+    /// let adb pick the only attached device. Required whenever more
+    /// than one transport is registered (e.g. USB + wireless both
+    /// active) — without it, `adb reverse` fails with `more than one
+    /// device/emulator`.
+    target_serial: Option<String>,
     reverse_active: Mutex<bool>,
 }
 
@@ -84,7 +67,20 @@ impl AdbLocalAbstractTransport {
         abstract_name: impl Into<String>,
         adb_path: impl Into<String>,
     ) -> io::Result<Self> {
+        Self::bind_with_adb_targeting(abstract_name, adb_path, None::<String>).await
+    }
+
+    /// Like [`bind_with_adb`] but targets a specific device serial with
+    /// `adb -s <serial>`. Pass `Some(host:port)` for wireless ADB so
+    /// the reverse-tunnel call doesn't fail with "more than one
+    /// device/emulator" when a USB tablet is also plugged in.
+    pub async fn bind_with_adb_targeting(
+        abstract_name: impl Into<String>,
+        adb_path: impl Into<String>,
+        target_serial: Option<impl Into<String>>,
+    ) -> io::Result<Self> {
         let abstract_name = abstract_name.into();
+        let target_serial: Option<String> = target_serial.map(Into::into);
         // Resolve scoop-style shims to their underlying executable. See
         // [`resolve_through_shim`] for the why; tl;dr: scoop's shimexe
         // wrapper falls back to console-mode handle inheritance when it
@@ -122,27 +118,37 @@ impl AdbLocalAbstractTransport {
         //    its Drop impl — that rule would point at a defunct TCP
         //    port, and overwriting via plain `adb reverse` should be
         //    fine in practice but let's be explicit.
+        //
+        //    When `target_serial` is set, every adb invocation is
+        //    prefixed with `-s <serial>`. Without it, `adb reverse`
+        //    errors with "more than one device/emulator" whenever
+        //    multiple transports are registered (the canonical case:
+        //    USB tablet AND wireless tablet both showing up in
+        //    `adb devices`).
         {
             let adb_path = adb_path.clone();
             let abstract_name = abstract_name.clone();
+            let target_serial = target_serial.clone();
             tokio::task::spawn_blocking(move || {
-                // Best-effort: ignore errors (no rule present is fine).
-                let _ = run_adb(
-                    &adb_path,
-                    &[
-                        "reverse",
-                        "--remove",
-                        &format!("localabstract:{abstract_name}"),
-                    ],
-                );
-                run_adb(
-                    &adb_path,
-                    &[
-                        "reverse",
-                        &format!("localabstract:{abstract_name}"),
-                        &format!("tcp:{bound_port}"),
-                    ],
-                )
+                let local_abs = format!("localabstract:{abstract_name}");
+                let tcp_arg = format!("tcp:{bound_port}");
+                // Best-effort cleanup; ignore errors (no rule present
+                // is fine).
+                let mut remove_args: Vec<&str> = Vec::new();
+                if let Some(serial) = target_serial.as_deref() {
+                    remove_args.push("-s");
+                    remove_args.push(serial);
+                }
+                remove_args.extend_from_slice(&["reverse", "--remove", &local_abs]);
+                let _ = run_adb(&adb_path, &remove_args);
+
+                let mut bind_args: Vec<&str> = Vec::new();
+                if let Some(serial) = target_serial.as_deref() {
+                    bind_args.push("-s");
+                    bind_args.push(serial);
+                }
+                bind_args.extend_from_slice(&["reverse", &local_abs, &tcp_arg]);
+                run_adb(&adb_path, &bind_args)
             })
             .await
             .map_err(|e| io::Error::other(format!("spawn_blocking join: {e}")))??;
@@ -153,6 +159,7 @@ impl AdbLocalAbstractTransport {
             listener: Mutex::new(Some(listener)),
             bound_port,
             adb_path,
+            target_serial,
             reverse_active: Mutex::new(true),
         })
     }
@@ -207,8 +214,12 @@ impl Transport for AdbLocalAbstractTransport {
                 tokio::task::spawn_blocking({
                     let adb_path = self.adb_path.clone();
                     let abstract_name = self.abstract_name.clone();
+                    let target_serial = self.target_serial.clone();
                     move || {
                         let mut cmd = Command::new(&adb_path);
+                        if let Some(serial) = target_serial.as_deref() {
+                            cmd.arg("-s").arg(serial);
+                        }
                         cmd.args([
                             "reverse",
                             "--remove",
@@ -234,6 +245,9 @@ impl Drop for AdbLocalAbstractTransport {
         if let Ok(mut active) = self.reverse_active.try_lock() {
             if *active {
                 let mut cmd = Command::new(&self.adb_path);
+                if let Some(serial) = self.target_serial.as_deref() {
+                    cmd.arg("-s").arg(serial);
+                }
                 cmd.args([
                     "reverse",
                     "--remove",
@@ -245,157 +259,5 @@ impl Drop for AdbLocalAbstractTransport {
                 *active = false;
             }
         }
-    }
-}
-
-/// Resolve a `Command::new(name)` style target through scoop's shim layer.
-///
-/// scoop installs binaries under `~/scoop/apps/<name>/current/...` and
-/// puts thin trampoline `name.exe` wrappers in `~/scoop/shims/`. Each
-/// trampoline reads a sibling `name.shim` text file containing the real
-/// target path, then `CreateProcessW`s it. The trampoline runs a PE
-/// header peek to decide GUI-vs-console handle wiring; on failure it
-/// logs `"Could not determine if target is a GUI app. Assuming console."`
-/// and tries to inherit the parent's console handles. A
-/// `windows_subsystem = "windows"` parent (Penflow's release build)
-/// has no console, the inheritance call returns invalid, and the whole
-/// CreateProcess fails with `"Could not create process"`.
-///
-/// Workaround: when we detect a `.shim` file next to the resolved
-/// path, parse the `path = "..."` line out of it and use that
-/// directly. The real adb.exe doesn't need a console.
-///
-/// On non-Windows platforms this is a no-op pass-through.
-#[cfg(windows)]
-fn resolve_through_shim(cmd: &str) -> String {
-    // Step 1: turn `cmd` into an absolute path on disk, by walking PATH
-    // if it's a bare name. Mirrors how `Command::new(cmd).spawn()`
-    // would search.
-    let candidate: std::path::PathBuf = if cmd.contains('\\') || cmd.contains('/') {
-        std::path::PathBuf::from(cmd)
-    } else {
-        let Some(path_var) = std::env::var_os("PATH") else {
-            return cmd.to_string();
-        };
-        let mut found: Option<std::path::PathBuf> = None;
-        'outer: for dir in std::env::split_paths(&path_var) {
-            for ext in ["", ".exe", ".bat", ".cmd"] {
-                let probe = dir.join(format!("{cmd}{ext}"));
-                if probe.is_file() {
-                    found = Some(probe);
-                    break 'outer;
-                }
-            }
-        }
-        match found {
-            Some(p) => p,
-            None => return cmd.to_string(), // let Command::new error naturally
-        }
-    };
-
-    // Step 2: if a sibling `.shim` exists (scoop convention), parse
-    // `path = "..."` out of it and prefer that over the trampoline.
-    let shim = candidate.with_extension("shim");
-    if shim.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&shim) {
-            for line in content.lines() {
-                let line = line.trim();
-                if let Some(rest) = line.strip_prefix("path") {
-                    let after_eq = rest.trim_start().strip_prefix('=').unwrap_or("").trim();
-                    let unquoted = after_eq.trim_matches('"');
-                    if !unquoted.is_empty() && std::path::Path::new(unquoted).is_file() {
-                        return unquoted.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    candidate.to_string_lossy().into_owned()
-}
-
-#[cfg(not(windows))]
-fn resolve_through_shim(cmd: &str) -> String {
-    cmd.to_string()
-}
-
-fn run_adb(adb_path: &str, args: &[&str]) -> io::Result<Output> {
-    let mut cmd = Command::new(adb_path);
-    cmd.args(args)
-        // Penflow's GUI binary has windows_subsystem="windows" in release,
-        // so the parent process has NO console — and therefore NO valid
-        // stdin handle. Some shim wrappers (notably scoop's shimexe) try
-        // to inherit and validate the parent's stdin and fail with
-        // "Shim: Could not start the executable" when it's invalid.
-        // Explicitly null stdin to give the child a well-defined handle.
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = silent(&mut cmd).output().map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "failed to invoke `{adb_path} {}`: {e}. Is adb on PATH?",
-                args.join(" ")
-            ),
-        )
-    })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        return Err(io::Error::other(format!(
-            "adb {} failed (status {:?}): stderr={stderr}; stdout={stdout}",
-            args.join(" "),
-            out.status.code()
-        )));
-    }
-    Ok(out)
-}
-
-#[cfg(test)]
-mod resolve_through_shim_tests {
-    use super::resolve_through_shim;
-
-    /// On non-Windows targets the function is a pass-through and the
-    /// scoop-style shim parsing isn't compiled, so most of the body
-    /// can't be exercised; smoke-test that the input is returned as-is.
-    #[cfg(not(windows))]
-    #[test]
-    fn pass_through_on_unix() {
-        assert_eq!(resolve_through_shim("adb"), "adb");
-    }
-
-    /// Windows: build a fake `~/scoop/shims/`-style layout in tempdir,
-    /// drop a `foo.exe` trampoline + `foo.shim` config, point PATH at
-    /// it, and verify resolve picks the path inside the .shim.
-    #[cfg(windows)]
-    #[test]
-    fn parses_scoop_shim_config() {
-        let tmp = std::env::temp_dir().join(format!("penflow-shim-test-{}", std::process::id()));
-        let shims = tmp.join("shims");
-        let real_dir = tmp.join("real");
-        std::fs::create_dir_all(&shims).unwrap();
-        std::fs::create_dir_all(&real_dir).unwrap();
-
-        let trampoline = shims.join("foo.exe");
-        let shim_cfg = shims.join("foo.shim");
-        let real_target = real_dir.join("foo.exe");
-        std::fs::write(&trampoline, b"trampoline-bytes").unwrap();
-        std::fs::write(&real_target, b"real-bytes").unwrap();
-        std::fs::write(&shim_cfg, format!("path = \"{}\"\n", real_target.display())).unwrap();
-
-        // Save + override PATH for the duration of the test.
-        let saved_path = std::env::var_os("PATH");
-        std::env::set_var("PATH", shims.as_os_str());
-
-        let resolved = resolve_through_shim("foo");
-        // Restore PATH BEFORE asserting so a panic doesn't leak.
-        match saved_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
-
-        assert_eq!(resolved, real_target.to_string_lossy());
     }
 }

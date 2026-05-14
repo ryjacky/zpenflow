@@ -15,6 +15,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(any(unix, windows))]
 pub mod adb;
+#[cfg(any(unix, windows))]
+pub(crate) mod util;
+#[cfg(any(unix, windows))]
+pub mod wireless;
 // `pub mod usb_aoa` was removed — the AOA path produced persistent block
 // artifacts on Snapdragon 8s Gen 3 / Adreno 720 that we couldn't fix at
 // the software layer (see `docs/usb-aoa-tearing.md` for the full diagnostic

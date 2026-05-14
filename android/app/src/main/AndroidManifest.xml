@@ -1,6 +1,16 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!--
+        ACCESS_NETWORK_STATE: needed for the wireless-debugging IP
+        readout on the status overlay (ConnectivityManager.allNetworks
+        / getLinkProperties). Normal protection level — granted at
+        install time, no runtime prompt. Also unblocks
+        NetworkInterface.getNetworkInterfaces() on Android 14+, which
+        returns null when the caller has zero network permissions.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <application
         android:label="Penflow"
         android:icon="@mipmap/ic_launcher"
