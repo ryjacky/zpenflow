@@ -277,8 +277,8 @@ impl Session {
     /// `events` (optional) receives lifecycle notifications. The function
     /// returns after the connection ends or `stop` flag is set.
     ///
-    /// `finish_on` (optional) — fire to ask the session to wrap up
-    /// cleanly (read loop aborts, [`MSG_PC_GOODBYE`] sent).
+    /// `finish_on` (optional) — when this receiver fires, the session
+    /// wraps up cleanly (read loop aborts, [`MSG_PC_GOODBYE`] sent).
     /// `finish_on = None` means the session runs until Android
     /// disconnects.
     pub async fn run(
