@@ -10,7 +10,6 @@ import {
     Title3,
     Subtitle2,
     Caption1,
-    Badge,
     MessageBar,
     MessageBarBody,
     MessageBarTitle,
@@ -241,6 +240,40 @@ const useStyles = makeStyles({
         marginTop: "-4px",
         marginBottom: "8px",
     },
+    // Primary-button green variant for the header Reconnect button when a
+    // peer is actually connected. Uses Fluent's success-status tokens so it
+    // tracks the active theme; brightness filter handles hover/pressed
+    // since the green palette doesn't ship explicit hover variants.
+    connectBtnConnected: {
+        backgroundColor: tokens.colorStatusSuccessBackground3,
+        ...shorthands.borderColor(tokens.colorStatusSuccessBorderActive),
+        color: tokens.colorNeutralForegroundOnBrand,
+        ":hover": {
+            backgroundColor: tokens.colorStatusSuccessBackground3,
+            ...shorthands.borderColor(tokens.colorStatusSuccessBorderActive),
+            color: tokens.colorNeutralForegroundOnBrand,
+            filter: "brightness(1.08)",
+        },
+        ":hover:active": {
+            backgroundColor: tokens.colorStatusSuccessBackground3,
+            ...shorthands.borderColor(tokens.colorStatusSuccessBorderActive),
+            color: tokens.colorNeutralForegroundOnBrand,
+            filter: "brightness(0.92)",
+        },
+    },
+    // Red disabled variant for the "Error" state. The :disabled override is
+    // needed because Fluent's default disabled rule otherwise paints the
+    // button neutral gray and would hide the danger signal.
+    connectBtnError: {
+        backgroundColor: tokens.colorStatusDangerBackground3,
+        ...shorthands.borderColor(tokens.colorStatusDangerBorderActive),
+        color: tokens.colorNeutralForegroundOnBrand,
+        ":disabled": {
+            backgroundColor: tokens.colorStatusDangerBackground3,
+            ...shorthands.borderColor(tokens.colorStatusDangerBorderActive),
+            color: tokens.colorNeutralForegroundOnBrand,
+        },
+    },
 });
 
 const MOD_ORDER = ["Ctrl", "Alt", "Shift", "Win"];
@@ -268,27 +301,6 @@ function numericSpinValue(data) {
     const raw = data.value ?? data.displayValue;
     const value = typeof raw === "number" ? raw : Number(raw);
     return Number.isFinite(value) ? Math.round(value) : null;
-}
-
-function statusBadge(state) {
-    switch (state.state) {
-        case "stopped":
-            return { color: "warning", text: "paused" };
-        case "preparing":
-            return { color: "informative", text: "starting" };
-        case "listening":
-            return { color: "informative", text: "ready" };
-        case "connecting":
-            return { color: "informative", text: "connecting" };
-        case "connected":
-            return { color: "success", text: "connected" };
-        case "disconnected":
-            return { color: "informative", text: "ready" };
-        case "error":
-            return { color: "danger", text: "error" };
-        default:
-            return { color: "subtle", text: state.state ?? "—" };
-    }
 }
 
 function statusDescription(state) {
@@ -637,8 +649,56 @@ export default function App() {
         );
     }
 
-    const badge = statusBadge(status);
     const isPaused = status.state === "stopped";
+    // Per-state shape of the header Connect/Reconnect button. The button
+    // doubles as a status indicator — only `connected` and the two
+    // listener-idle states ({listening, disconnected}) are clickable;
+    // everything else is rendered disabled with a state-specific label so
+    // the user knows why they can't reconnect right now.
+    let connectLabel;
+    let connectClass; // optional makeStyles class for green/red variants
+    let connectDisabled = false;
+    switch (status.state) {
+        case "connected":
+            connectLabel = "Reconnect";
+            connectClass = styles.connectBtnConnected;
+            break;
+        case "listening":
+        case "disconnected":
+            // Auto-connect handles tablet attach for us, so there's nothing
+            // for the user to do here — show the wait state and keep the
+            // button disabled. Reconnect only becomes a meaningful action
+            // once a peer is actually connected (or to bust a wedged
+            // listener after USB cycle, which is rare — Pause/Resume
+            // covers that case explicitly).
+            connectLabel = "Waiting for tablet…";
+            connectDisabled = true;
+            break;
+        case "preparing":
+            connectLabel = "Preparing…";
+            connectDisabled = true;
+            break;
+        case "connecting":
+            connectLabel = "Connecting…";
+            connectDisabled = true;
+            break;
+        case "error":
+            connectLabel = "Error";
+            connectClass = styles.connectBtnError;
+            connectDisabled = true;
+            break;
+        case "stopped":
+            // Paused via the Pause button. Surface Connect here so the
+            // header button doubles as a one-click start — saves settings
+            // and brings the service up. Resume in the footer does the
+            // same minus the settings flush.
+            connectLabel = "Connect";
+            break;
+        default:
+            connectLabel = status.state ?? "—";
+            connectDisabled = true;
+            break;
+    }
     const vddResolution = settings.vdd_resolution ?? DEFAULT_RESOLUTION;
     const selectedResolution = resolutionKey(vddResolution);
     const setVddResolution = (next) => {
@@ -650,7 +710,14 @@ export default function App() {
             <header className={styles.header}>
                 <Title3 className={styles.title}>Penflow</Title3>
                 <span className={styles.statusDetail}>{statusDescription(status)}</span>
-                <Badge appearance="filled" color={badge.color}>{badge.text}</Badge>
+                <Button
+                    appearance="primary"
+                    onClick={onConnect}
+                    disabled={connectDisabled}
+                    className={connectClass}
+                >
+                    {connectLabel}
+                </Button>
             </header>
 
             {!vddInstalled && (
@@ -883,9 +950,6 @@ export default function App() {
             <footer className={styles.footer}>
                 <span className={styles.saveStatus}>{saveMsg}</span>
                 <Button onClick={onToggle}>{isPaused ? "Resume" : "Pause"}</Button>
-                <Button appearance="primary" onClick={onConnect}>
-                    {isPaused ? "Connect" : "Reconnect"}
-                </Button>
             </footer>
         </div>
     );
