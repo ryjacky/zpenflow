@@ -277,20 +277,20 @@ impl Session {
     /// `events` (optional) receives lifecycle notifications. The function
     /// returns after the connection ends or `stop` flag is set.
     ///
-    /// `cancel` (optional) requests graceful shutdown. When the receiver
-    /// fires, the read loop is aborted but cleanup still runs, so
-    /// [`MSG_PC_GOODBYE`] is written before return. Without this the
-    /// Android client blocks on a stale socket — `adb reverse` doesn't
-    /// propagate TCP FIN. Pass `None` to run until the client
+    /// `finish_on` (optional) — fire to ask the session to wrap up
+    /// cleanly (read loop aborts, [`MSG_PC_GOODBYE`] sent).
+    /// `finish_on = None` means the session runs until Android
     /// disconnects.
     pub async fn run(
         mut self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
-        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+        finish_on: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(), SessionError> {
         if self.cfg.screen_off {
-            return self.run_screen_off(transport, events, cancel).await;
+            return self
+                .run_screen_off(transport, events, finish_on)
+                .await;
         }
 
         let session_start = Instant::now();
@@ -635,11 +635,12 @@ impl Session {
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
-        // The optional `cancel` arm lets the caller request a graceful
-        // stop (GUI Pause) — we abort the read task and fall through to
-        // the cleanup path below so MSG_PC_GOODBYE still goes out.
+        // The optional `finish_on` arm lets the caller request a clean
+        // wrap-up (used by GUI Pause) — we abort the read task and fall
+        // through to the cleanup path below so MSG_PC_GOODBYE still
+        // goes out.
         let mut dispatch = dispatch;
-        let mut cancel_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match cancel {
+        let mut finish_on_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish_on {
             Some(rx) => Box::pin(async move {
                 let _ = rx.await;
             }),
@@ -658,8 +659,8 @@ impl Session {
                 Some(()) = idr_rx.recv() => {
                     engine.request_idr();
                 }
-                _ = &mut cancel_fut => {
-                    eprintln!("[session] graceful cancel — aborting read loop, sending MSG_PC_GOODBYE");
+                _ = &mut finish_on_fut => {
+                    eprintln!("[session] finish signal — aborting read loop, sending MSG_PC_GOODBYE");
                     dispatch.abort();
                     break Ok(());
                 }
@@ -706,7 +707,7 @@ impl Session {
         self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
-        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
+        finish_on: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(), SessionError> {
         debug_assert!(
             self.cfg.vdd.is_none(),
@@ -821,11 +822,11 @@ impl Session {
         // read_loop wants an idr sender; with no engine we just drop the rx.
         let (idr_tx, _idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-        // `select!` between the read loop and the cancel signal: whichever
+        // `select!` between the read loop and `finish_on`: whichever
         // completes first wins, the other is dropped. Both paths fall
-        // through to the MSG_PC_GOODBYE write below. Routing cancel through
-        // here (instead of letting the caller drop the whole future on
-        // Pause) is what keeps that write reachable.
+        // through to the MSG_PC_GOODBYE write below. Routing `finish_on`
+        // through here (instead of letting the caller drop the whole
+        // future on Pause) is what keeps that write reachable.
         let read_future = read_loop(
             reader,
             writer.clone(),
@@ -836,7 +837,7 @@ impl Session {
             idr_tx,
             session_start,
         );
-        let cancel_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match cancel {
+        let finish_on_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish_on {
             Some(rx) => Box::pin(async move {
                 let _ = rx.await;
             }),
@@ -844,8 +845,8 @@ impl Session {
         };
         let read_result = tokio::select! {
             r = read_future => r,
-            _ = cancel_fut => {
-                eprintln!("[session] graceful cancel (screen_off) — sending MSG_PC_GOODBYE");
+            _ = finish_on_fut => {
+                eprintln!("[session] finish signal (screen_off) — sending MSG_PC_GOODBYE");
                 Ok(())
             }
         };

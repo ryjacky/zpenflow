@@ -220,22 +220,20 @@ impl Service {
             });
 
             eprintln!("[service] running session (waiting for android client)");
-            // When the GUI calls stop() it fires `cancel` (the accept-loop
-            // parameter). We forward that into the session via this pair
-            // so it can write MSG_PC_GOODBYE before teardown — `adb
-            // reverse` doesn't propagate FIN, so without this Android
-            // stays stuck on a dead socket.
-            let (session_cancel_tx, session_cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            // Scope session_run so it drops before transport.shutdown():
-            // a pre-handshake pause is blocked in accept() and can't
-            // observe its cancel; drop releases the listener mutex
-            // shutdown needs.
+            // Channel for forwarding the outer `cancel` into the session
+            // as `finish_on`. Needed because `adb reverse` doesn't
+            // propagate FIN — without it Android stays stuck on a dead
+            // socket after stop().
+            let (session_finish_tx, session_finish_rx) = tokio::sync::oneshot::channel::<()>();
+            // Scope so dropping `session_run` cancels any in-flight
+            // accept() — otherwise transport.shutdown() below would
+            // deadlock waiting for the listener mutex.
             let cancelled = {
                 let session = Session::new(cfg);
                 let session_run = session.run(
                     Arc::clone(&transport),
                     Some(tx),
-                    Some(session_cancel_rx),
+                    Some(session_finish_rx),
                 );
                 tokio::pin!(session_run);
                 // Phase 1: either the session ends on its own (Android
@@ -260,8 +258,8 @@ impl Service {
                         false
                     }
                     _ = &mut cancel => {
-                        eprintln!("[service] cancel requested — signaling session for graceful stop");
-                        let _ = session_cancel_tx.send(());
+                        eprintln!("[service] cancel requested — signaling session to finish");
+                        let _ = session_finish_tx.send(());
                         true
                     }
                 };
@@ -271,10 +269,10 @@ impl Service {
                 // scope exit handles teardown.
                 if cancelled {
                     match tokio::time::timeout(Duration::from_secs(3), &mut session_run).await {
-                        Ok(_) => eprintln!("[service] session finished graceful stop"),
+                        Ok(_) => eprintln!("[service] session honored finish signal"),
                         Err(_) => {
-                            eprintln!("[service] session graceful stop timed out — proceeding to teardown");
-                            log_diagnostic("[service] session graceful stop timed out");
+                            eprintln!("[service] session finish timed out — proceeding to teardown");
+                            log_diagnostic("[service] session finish timed out");
                         }
                     }
                 }
