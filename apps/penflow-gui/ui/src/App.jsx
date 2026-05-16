@@ -503,11 +503,18 @@ export default function App() {
     const [vmultiInstalled, setVmultiInstalled] = useState(true);
     const [vmultiInstalling, setVmultiInstalling] = useState(false);
     const [vmultiInstallError, setVmultiInstallError] = useState("");
+    // Skip the first auto-save pass so loading settings from disk doesn't
+    // immediately round-trip them back.
+    const skipNextAutoSaveRef = useRef(true);
+    // Tracks the last persisted value of run_as_admin so we only trigger the
+    // UAC relaunch on the off→on transition, not on every later save.
+    const prevRunAsAdminRef = useRef(false);
 
     // Initial load.
     useEffect(() => {
         (async () => {
             const s = await invoke("get_settings");
+            prevRunAsAdminRef.current = !!s.run_as_admin;
             setSettings(s);
             setSlots([
                 bindingToState(s.bindings.button_0),
@@ -550,7 +557,10 @@ export default function App() {
         }
     }, []);
 
-    const onSave = useCallback(async () => {
+    // Persist the current settings + button bindings. Used both by the
+    // debounced auto-save effect below and by the Connect/Reconnect button to
+    // flush any in-flight changes before the service restarts.
+    const persistSettings = useCallback(async () => {
         if (!settings) return;
         const next = {
             ...settings,
@@ -564,7 +574,9 @@ export default function App() {
         try {
             await invoke("save_settings", { new: next });
             setSaveMsg("saved");
-            if (next.run_as_admin) {
+            const wasOn = prevRunAsAdminRef.current;
+            prevRunAsAdminRef.current = !!next.run_as_admin;
+            if (next.run_as_admin && !wasOn) {
                 const e = await invoke("is_elevated");
                 if (!e) {
                     setSaveMsg("relaunching as administrator…");
@@ -574,14 +586,48 @@ export default function App() {
         } catch (e) {
             setSaveMsg("error: " + e);
         }
-        setTimeout(() => setSaveMsg(""), 3000);
     }, [settings, slots]);
+
+    // Auto-save: persist any change to settings or button bindings after a
+    // short debounce. The first pass after initial load is skipped via
+    // skipNextAutoSaveRef so we don't immediately round-trip the loaded value.
+    useEffect(() => {
+        if (!settings) return;
+        if (skipNextAutoSaveRef.current) {
+            skipNextAutoSaveRef.current = false;
+            return;
+        }
+        const timer = setTimeout(persistSettings, 400);
+        return () => clearTimeout(timer);
+    }, [persistSettings, settings]);
+
+    // Clear transient "saved" / "error" messages after a few seconds. "saving…"
+    // and "relaunching…" are left alone — they get replaced by the next save's
+    // own status.
+    useEffect(() => {
+        if (saveMsg === "saved" || saveMsg.startsWith("error")) {
+            const t = setTimeout(() => setSaveMsg(""), 3000);
+            return () => clearTimeout(t);
+        }
+    }, [saveMsg]);
 
     const onToggle = useCallback(async () => {
         const cur = await invoke("get_status");
         if (cur.state === "stopped") await invoke("start_service");
         else                          await invoke("stop_service");
     }, []);
+
+    // Save first (so the service comes back up with the latest settings),
+    // then start (if stopped) or stop+start (to re-apply settings while
+    // already running).
+    const onConnect = useCallback(async () => {
+        await persistSettings();
+        const cur = await invoke("get_status");
+        if (cur.state !== "stopped") {
+            await invoke("stop_service");
+        }
+        await invoke("start_service");
+    }, [persistSettings]);
 
     if (!settings) {
         return (
@@ -837,7 +883,9 @@ export default function App() {
             <footer className={styles.footer}>
                 <span className={styles.saveStatus}>{saveMsg}</span>
                 <Button onClick={onToggle}>{isPaused ? "Resume" : "Pause"}</Button>
-                <Button appearance="primary" onClick={onSave}>Save</Button>
+                <Button appearance="primary" onClick={onConnect}>
+                    {isPaused ? "Connect" : "Reconnect"}
+                </Button>
             </footer>
         </div>
     );
