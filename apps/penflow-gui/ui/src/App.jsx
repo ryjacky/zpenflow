@@ -67,13 +67,14 @@ const useStyles = makeStyles({
         letterSpacing: "0.05em",
         color: tokens.colorNeutralForeground3,
     },
-    rowGroup: {
-        display: "grid",
-        gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
-        gap: "20px",
-    },
-    column: {
-        minWidth: 0,
+    subCardTitle: {
+        marginTop: "24px",
+        marginBottom: "12px",
+        paddingTop: "16px",
+        textTransform: "uppercase",
+        letterSpacing: "0.05em",
+        color: tokens.colorNeutralForeground3,
+        ...shorthands.borderTop("1px", "solid", tokens.colorNeutralStroke3),
     },
     row: {
         display: "flex",
@@ -739,86 +740,80 @@ export default function App() {
                         )}
                     </>
                 )}
+                {showEncoder && (
+                    <>
+                        <Subtitle2 className={styles.subCardTitle}>Encoder</Subtitle2>
+                        <Field label="Bitrate (Mbps)" orientation="horizontal" className={styles.row}>
+                            <SpinButton
+                                value={Math.round(settings.bitrate_bps / 1_000_000)}
+                                min={5}
+                                max={500}
+                                step={5}
+                                onChange={(_, d) => {
+                                    const v = d.value ?? Number(d.displayValue);
+                                    if (Number.isFinite(v)) {
+                                        setSettings({ ...settings, bitrate_bps: v * 1_000_000 });
+                                    }
+                                }}
+                            />
+                        </Field>
+                        <Field label="Frame rate" orientation="horizontal" className={styles.row}>
+                            <Dropdown
+                                value={`${settings.fps} fps`}
+                                selectedOptions={[String(settings.fps)]}
+                                onOptionSelect={(_, d) => setSettings({ ...settings, fps: Number(d.optionValue) })}
+                            >
+                                <Option value="60">60 fps</Option>
+                                <Option value="90">90 fps</Option>
+                                <Option value="120">120 fps</Option>
+                            </Dropdown>
+                        </Field>
+                        <Field label="Codec" orientation="horizontal" className={styles.row}>
+                            <Dropdown
+                                value={settings.codec === "hevc" ? "HEVC" : "H.264"}
+                                selectedOptions={[settings.codec]}
+                                onOptionSelect={(_, d) => setSettings({ ...settings, codec: d.optionValue })}
+                            >
+                                <Option value="hevc">HEVC</Option>
+                                <Option value="h264">H.264</Option>
+                            </Dropdown>
+                        </Field>
+                    </>
+                )}
             </section>
 
             <section className={styles.card}>
-                <div className={styles.rowGroup}>
-                    <div className={styles.column}>
-                        {showEncoder && (
-                            <>
-                                <Subtitle2 className={styles.cardTitle}>Encoder</Subtitle2>
-                                <Field label="Bitrate (Mbps)" orientation="horizontal" className={styles.row}>
-                                    <SpinButton
-                                        value={Math.round(settings.bitrate_bps / 1_000_000)}
-                                        min={5}
-                                        max={500}
-                                        step={5}
-                                        onChange={(_, d) => {
-                                            const v = d.value ?? Number(d.displayValue);
-                                            if (Number.isFinite(v)) {
-                                                setSettings({ ...settings, bitrate_bps: v * 1_000_000 });
-                                            }
-                                        }}
-                                    />
-                                </Field>
-                                <Field label="Frame rate" orientation="horizontal" className={styles.row}>
-                                    <Dropdown
-                                        value={`${settings.fps} fps`}
-                                        selectedOptions={[String(settings.fps)]}
-                                        onOptionSelect={(_, d) => setSettings({ ...settings, fps: Number(d.optionValue) })}
-                                    >
-                                        <Option value="60">60 fps</Option>
-                                        <Option value="90">90 fps</Option>
-                                        <Option value="120">120 fps</Option>
-                                    </Dropdown>
-                                </Field>
-                                <Field label="Codec" orientation="horizontal" className={styles.row}>
-                                    <Dropdown
-                                        value={settings.codec === "hevc" ? "HEVC" : "H.264"}
-                                        selectedOptions={[settings.codec]}
-                                        onOptionSelect={(_, d) => setSettings({ ...settings, codec: d.optionValue })}
-                                    >
-                                        <Option value="hevc">HEVC</Option>
-                                        <Option value="h264">H.264</Option>
-                                    </Dropdown>
-                                </Field>
-                            </>
-                        )}
-                    </div>
-                    <div className={styles.column}>
-                        <Subtitle2 className={styles.cardTitle}>System</Subtitle2>
-                        <div className={styles.row}>
-                            <span className={styles.rowLabel} title="Add Penflow to your Windows logon">
-                                Start with Windows
-                            </span>
-                            <Switch
-                                checked={settings.autostart}
-                                onChange={(_, d) => setSettings({ ...settings, autostart: d.checked })}
-                            />
-                        </div>
-                        <div className={styles.row}>
-                            <span className={styles.rowLabel} title="Required for injecting input into elevated apps">
-                                Run as administrator
-                            </span>
-                            <Switch
-                                checked={settings.run_as_admin}
-                                onChange={(_, d) => setSettings({ ...settings, run_as_admin: d.checked })}
-                            />
-                        </div>
-                        <div className={styles.row}>
-                            <span className={styles.rowLabel} title="Show the latency HUD overlay on the tablet. Takes effect after the next reconnect.">
-                                Show tablet HUD overlay
-                            </span>
-                            <Switch
-                                checked={settings.hud_enabled !== false}
-                                onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
-                            />
-                        </div>
-                        <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
-                            {elevated ? "Currently running as administrator" : "Currently running unelevated"}
-                        </Caption1>
-                    </div>
+                <Subtitle2 className={styles.cardTitle}>System</Subtitle2>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Add Penflow to your Windows logon">
+                        Start with Windows
+                    </span>
+                    <Switch
+                        checked={settings.autostart}
+                        onChange={(_, d) => setSettings({ ...settings, autostart: d.checked })}
+                    />
                 </div>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Required for injecting input into elevated apps">
+                        Run as administrator
+                    </span>
+                    <Switch
+                        checked={settings.run_as_admin}
+                        onChange={(_, d) => setSettings({ ...settings, run_as_admin: d.checked })}
+                    />
+                </div>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Show the latency HUD overlay on the tablet. Takes effect after the next reconnect.">
+                        Show tablet HUD overlay
+                    </span>
+                    <Switch
+                        checked={settings.hud_enabled !== false}
+                        onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
+                    />
+                </div>
+                <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
+                    {elevated ? "Currently running as administrator" : "Currently running unelevated"}
+                </Caption1>
             </section>
 
             <section className={styles.card}>
