@@ -230,11 +230,8 @@ impl Service {
             // deadlock waiting for the listener mutex.
             let cancelled = {
                 let session = Session::new(cfg);
-                let session_run = session.run(
-                    Arc::clone(&transport),
-                    Some(tx),
-                    Some(session_finish_rx),
-                );
+                let session_run =
+                    session.run(Arc::clone(&transport), Some(tx), Some(session_finish_rx));
                 tokio::pin!(session_run);
                 // Phase 1: either the session ends on its own (Android
                 // disconnects → read loop EOF → cleanup) or the user
@@ -271,7 +268,9 @@ impl Service {
                     match tokio::time::timeout(Duration::from_secs(3), &mut session_run).await {
                         Ok(_) => eprintln!("[service] session honored finish signal"),
                         Err(_) => {
-                            eprintln!("[service] session finish timed out — proceeding to teardown");
+                            eprintln!(
+                                "[service] session finish timed out — proceeding to teardown"
+                            );
                             log_diagnostic("[service] session finish timed out");
                         }
                     }
@@ -279,11 +278,7 @@ impl Service {
                 cancelled
             };
             if cancelled {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    transport.shutdown(),
-                )
-                .await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), transport.shutdown()).await;
                 event_pump.abort();
                 return;
             }

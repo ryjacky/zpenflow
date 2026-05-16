@@ -277,10 +277,10 @@ impl Session {
     /// `events` (optional) receives lifecycle notifications. The function
     /// returns after the connection ends or `stop` flag is set.
     ///
-    /// `finish` (optional) — when this receiver fires, the session
-    /// wraps up cleanly (read loop aborts, [`MSG_PC_GOODBYE`] sent).
-    /// `finish = None` means the session runs until Android
-    /// disconnects.
+    /// `finish` (optional) — when the caller sends on the matching
+    /// `Sender`, the session wraps up cleanly (read loop aborts,
+    /// [`MSG_PC_GOODBYE`] written). `finish = None` means the session
+    /// runs until Android disconnects.
     pub async fn run(
         mut self,
         transport: Arc<dyn Transport>,
@@ -288,9 +288,7 @@ impl Session {
         finish: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(), SessionError> {
         if self.cfg.screen_off {
-            return self
-                .run_screen_off(transport, events, finish)
-                .await;
+            return self.run_screen_off(transport, events, finish).await;
         }
 
         let session_start = Instant::now();
