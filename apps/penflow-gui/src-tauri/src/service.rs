@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 
 use penflow_core::inject::binding::{Binding as CoreBinding, MouseButtonKind, PenButtonProfile};
 use penflow_core::Engine;
+use penflow_server::diag::log as dlog;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
 use penflow_transport::Transport;
@@ -112,8 +113,10 @@ impl Service {
     pub async fn start(self: &Arc<Self>) {
         let mut inner = self.inner.lock().await;
         if inner.task.is_some() {
+            dlog("[service] start() ignored — accept loop already running");
             return;
         }
+        dlog("[service] start() spawning accept loop");
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let me = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -125,6 +128,7 @@ impl Service {
 
     /// Stop the accept-loop. Cancels any in-flight session as well.
     pub async fn stop(&self) {
+        dlog("[service] stop() requested");
         let mut inner = self.inner.lock().await;
         if let Some(c) = inner.cancel.take() {
             let _ = c.send(());
@@ -136,18 +140,27 @@ impl Service {
         }
         inner.last_state = ServiceState::Stopped;
         let _ = self.events.send(ServiceState::Stopped);
+        // Snapshot monitor list AFTER stop — Issue 1 diagnosis. If VDD's
+        // virtual monitor is still attached here, Drop on VddController
+        // didn't fire (or its disable failed silently), and reconnect
+        // will see a "leftover VDD" and try to clean it up the long way.
+        log_monitor_snapshot("after stop()");
     }
 
     async fn emit(&self, s: ServiceState) {
+        dlog(&format!("[service] emit state: {s:?}"));
         self.inner.lock().await.last_state = s.clone();
         let _ = self.events.send(s);
     }
 
     async fn run_accept_loop(self: Arc<Self>, mut cancel: tokio::sync::oneshot::Receiver<()>) {
         eprintln!("[service] accept loop started");
+        dlog("[service] accept loop started");
+        log_monitor_snapshot("accept loop entry");
         loop {
             if cancel.try_recv().is_ok() {
                 eprintln!("[service] cancel received, exiting");
+                dlog("[service] cancel received, accept loop exiting");
                 return;
             }
 
@@ -220,30 +233,76 @@ impl Service {
             });
 
             eprintln!("[service] running session (waiting for android client)");
-            let session = Session::new(cfg);
-            let session_run = session.run(Arc::clone(&transport), Some(tx));
-            tokio::select! {
-                r = session_run => match r {
-                    Ok(()) => {
-                        eprintln!("[service] session ended cleanly (Disconnected)");
-                        self.emit(ServiceState::Disconnected).await;
+            // Build a per-session cancel pair. We forward the outer
+            // accept-loop cancel into the session so it can do graceful
+            // teardown (MSG_PC_GOODBYE write + transport drop) instead of
+            // being aborted mid-await. Without this, `adb reverse` won't
+            // propagate FIN to Android and the client sits on a stale
+            // socket forever — repro: pause, then reconnect, Android UI
+            // says "connected" but PC stays on Listening.
+            let (session_cancel_tx, session_cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            //
+            // The session_run future is scoped so that it is *dropped*
+            // before we call `transport.shutdown()` below. If we paused
+            // pre-handshake, the session is blocked inside
+            // `transport.accept().await` and will never observe its
+            // cancel signal; the bounded `timeout(...)` falls through,
+            // the scope exits, and the drop releases the listener mutex
+            // that `transport.shutdown()` needs.
+            let cancelled = {
+                let session = Session::new(cfg);
+                let session_run = session.run(
+                    Arc::clone(&transport),
+                    Some(tx),
+                    Some(session_cancel_rx),
+                );
+                tokio::pin!(session_run);
+                // Phase 1: race session against outer cancel.
+                let cancelled = tokio::select! {
+                    r = &mut session_run => {
+                        match r {
+                            Ok(()) => {
+                                eprintln!("[service] session ended cleanly (Disconnected)");
+                                self.emit(ServiceState::Disconnected).await;
+                            }
+                            Err(e) => {
+                                let msg = format!("session: {e}");
+                                eprintln!("[service] {msg}");
+                                log_diagnostic(&msg);
+                                self.emit(ServiceState::Error { message: msg }).await;
+                            }
+                        }
+                        false
                     }
-                    Err(e) => {
-                        let msg = format!("session: {e}");
-                        eprintln!("[service] {msg}");
-                        log_diagnostic(&msg);
-                        self.emit(ServiceState::Error { message: msg }).await;
+                    _ = &mut cancel => {
+                        eprintln!("[service] cancel requested — signaling session for graceful stop");
+                        let _ = session_cancel_tx.send(());
+                        true
                     }
-                },
-                _ = &mut cancel => {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        transport.shutdown(),
-                    )
-                    .await;
-                    event_pump.abort();
-                    return;
+                };
+                // Phase 2: bounded wait for the session to finish its
+                // goodbye write + cleanup. If the session was pre-handshake
+                // (stuck on accept), this just times out and the drop on
+                // scope exit handles teardown.
+                if cancelled {
+                    match tokio::time::timeout(Duration::from_secs(3), &mut session_run).await {
+                        Ok(_) => eprintln!("[service] session finished graceful stop"),
+                        Err(_) => {
+                            eprintln!("[service] session graceful stop timed out — proceeding to teardown");
+                            log_diagnostic("[service] session graceful stop timed out");
+                        }
+                    }
                 }
+                cancelled
+            };
+            if cancelled {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    transport.shutdown(),
+                )
+                .await;
+                event_pump.abort();
+                return;
             }
 
             // Drain the event pump and tear down the transport before
@@ -304,31 +363,32 @@ fn bundled_or_path_adb() -> String {
     "adb".to_string()
 }
 
-/// Append a diagnostic line to %APPDATA%/Penflow/debug.log. Best-effort —
-/// failures here are silently dropped (we don't want logging itself to be
-/// the thing that hangs a service-startup error path).
+/// Legacy alias for the shared file logger. Kept so existing call sites
+/// in the error paths above don't need to change. New code should call
+/// [`dlog`] directly.
 fn log_diagnostic(msg: &str) {
-    use std::io::Write;
-    let Some(base) = std::env::var_os("APPDATA").map(std::path::PathBuf::from) else {
-        return;
-    };
-    let dir = base.join("Penflow");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+    dlog(msg);
+}
+
+/// One-line summary of every monitor `Engine::list_monitors` returns, so
+/// the debug.log captures the desktop topology at each transition.
+/// Critical for Issue 1 (does VDD's virtual monitor come back after
+/// reconnect?) and Issue 2 (is there a screen to the right of primary
+/// when the user reports their pen leaking there?).
+fn log_monitor_snapshot(tag: &str) {
+    match Engine::list_monitors() {
+        Ok(ms) => {
+            dlog(&format!("[service] monitor snapshot ({tag}): {} entries", ms.len()));
+            for (i, m) in ms.iter().enumerate() {
+                dlog(&format!(
+                    "[service]   [{i}] {}x{} attached={} virtual={} software={} name={:?}",
+                    m.width, m.height, m.attached_to_desktop, m.looks_virtual,
+                    m.adapter_is_software, m.device_name,
+                ));
+            }
+        }
+        Err(e) => dlog(&format!("[service] monitor snapshot ({tag}): list_monitors failed: {e}")),
     }
-    let path = dir.join("debug.log");
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    else {
-        return;
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = writeln!(f, "[{now}] {msg}");
 }
 
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
@@ -392,12 +452,25 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
     // clone is too unreliable to drive the VDD as a mirror).
     let vdd = if matches!(s.topology, settings::TopologyMode::Duplicate) {
         eprintln!("[service] Duplicate mode — bypassing VDD");
+        dlog("[service] build_session_config: Duplicate mode, VDD bypassed");
         None
     } else {
         match VddController::detect() {
-            Ok(opt) => opt,
+            Ok(Some(ctrl)) => {
+                dlog(&format!(
+                    "[service] build_session_config: VDD detected — instance_id={} friendly={}",
+                    ctrl.instance_id(),
+                    ctrl.friendly_name(),
+                ));
+                Some(ctrl)
+            }
+            Ok(None) => {
+                dlog("[service] build_session_config: VDD detect returned None (not installed?)");
+                None
+            }
             Err(e) => {
                 eprintln!("[service] VDD detection failed: {e}");
+                dlog(&format!("[service] build_session_config: VDD detect failed: {e}"));
                 None
             }
         }

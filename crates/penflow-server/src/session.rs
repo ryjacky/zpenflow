@@ -18,6 +18,8 @@
 //!    down cleanly.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -47,6 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
 };
 
+use crate::diag::log as dlog;
 use crate::vdd::{
     force_monitor_mode, snapshot_attached_monitor_keys, wait_for_virtual_monitor, VddController,
     VddError,
@@ -272,15 +275,24 @@ impl Session {
     /// Run one session: open the engine, accept the transport stream, do the
     /// handshake, pump frames + dispatch input until the client disconnects.
     ///
-    /// `events` (optional) receives lifecycle notifications. The function
-    /// returns after the connection ends or `stop` flag is set.
+    /// `events` (optional) receives lifecycle notifications.
+    ///
+    /// `cancel` (optional) is a graceful-stop signal. When the receiver
+    /// fires, the read loop is aborted and the function falls through to
+    /// its normal cleanup path — including the [`MSG_PC_GOODBYE`] write —
+    /// instead of being dropped mid-session. Pass `None` for "run until
+    /// the client hangs up." Required by the GUI pause path: dropping
+    /// `Session::run` via `tokio::select!` skips the goodbye write, and
+    /// `adb reverse` doesn't propagate TCP FIN to Android, so the client
+    /// never realises the PC has paused.
     pub async fn run(
         mut self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
+        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(), SessionError> {
         if self.cfg.screen_off {
-            return self.run_screen_off(transport, events).await;
+            return self.run_screen_off(transport, events, cancel).await;
         }
 
         let session_start = Instant::now();
@@ -336,8 +348,19 @@ impl Session {
                 vdd.friendly_name(),
                 vdd.instance_id()
             );
+            dlog(&format!(
+                "[session] enabling VDD '{}' instance_id={}",
+                vdd.friendly_name(),
+                vdd.instance_id(),
+            ));
             let baseline_attached = snapshot_attached_monitor_keys()?;
-            vdd.enable()?;
+            match vdd.enable() {
+                Ok(()) => dlog("[session] VDD enable() returned Ok"),
+                Err(e) => {
+                    dlog(&format!("[session] VDD enable() FAILED: {e}"));
+                    return Err(e.into());
+                }
+            }
             // Windows + the VDD driver itself can take a couple of seconds
             // to publish the new monitor through DXGI on a cold start (it
             // re-reads vdd_settings.xml, calls IddCxMonitorArrival, and
@@ -345,12 +368,25 @@ impl Session {
             // generous; if we hit this we genuinely have a driver/topology
             // problem.
             let instance_id = vdd.instance_id().to_string();
-            let mut virt = wait_for_virtual_monitor(
+            let mut virt = match wait_for_virtual_monitor(
                 Duration::from_secs(15),
                 Some(&instance_id),
                 Some(&baseline_attached),
             )
-            .await?;
+            .await
+            {
+                Ok(v) => {
+                    dlog(&format!(
+                        "[session] wait_for_virtual_monitor OK — {} {}x{}",
+                        v.device_name, v.width, v.height
+                    ));
+                    v
+                }
+                Err(e) => {
+                    dlog(&format!("[session] wait_for_virtual_monitor FAILED: {e}"));
+                    return Err(e.into());
+                }
+            };
             eprintln!(
                 "[session] virtual monitor up: {} {}x{} on {} (adapter LUID 0x{:016x})",
                 virt.device_name, virt.width, virt.height, virt.adapter_name, virt.adapter_luid
@@ -625,7 +661,16 @@ impl Session {
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
+        // The optional `cancel` arm lets the caller request a graceful
+        // stop (GUI Pause) — we abort the read task and fall through to
+        // the cleanup path below so MSG_PC_GOODBYE still goes out.
         let mut dispatch = dispatch;
+        let mut cancel_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match cancel {
+            Some(rx) => Box::pin(async move {
+                let _ = rx.await;
+            }),
+            None => Box::pin(std::future::pending()),
+        };
         let read_result: Result<(), SessionError> = loop {
             tokio::select! {
                 r = &mut dispatch => match r {
@@ -638,6 +683,11 @@ impl Session {
                 },
                 Some(()) = idr_rx.recv() => {
                     engine.request_idr();
+                }
+                _ = &mut cancel_fut => {
+                    eprintln!("[session] graceful cancel — aborting read loop, sending MSG_PC_GOODBYE");
+                    dispatch.abort();
+                    break Ok(());
                 }
             }
         };
@@ -682,6 +732,7 @@ impl Session {
         self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
+        cancel: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(), SessionError> {
         debug_assert!(
             self.cfg.vdd.is_none(),
@@ -796,7 +847,10 @@ impl Session {
         // read_loop wants an idr sender; with no engine we just drop the rx.
         let (idr_tx, _idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-        let read_result = read_loop(
+        // Race the read loop against the graceful-cancel signal so a GUI
+        // Pause still hits the MSG_PC_GOODBYE write below instead of
+        // being dropped mid-await.
+        let read_future = read_loop(
             reader,
             writer.clone(),
             injector,
@@ -805,8 +859,20 @@ impl Session {
             android.display_height,
             idr_tx,
             session_start,
-        )
-        .await;
+        );
+        let cancel_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match cancel {
+            Some(rx) => Box::pin(async move {
+                let _ = rx.await;
+            }),
+            None => Box::pin(std::future::pending()),
+        };
+        let read_result = tokio::select! {
+            r = read_future => r,
+            _ = cancel_fut => {
+                eprintln!("[session] graceful cancel (screen_off) — sending MSG_PC_GOODBYE");
+                Ok(())
+            }
+        };
 
         {
             let mut w = writer.lock().await;
