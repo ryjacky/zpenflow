@@ -285,15 +285,16 @@ const useStyles = makeStyles({
     },
 });
 
-/** Inline refresh / sync icon used by the header reconnect button.
- *  Inlined as SVG so we don't pull in @fluentui/react-icons (~10 MB) for
- *  a single 16×16 glyph. `currentColor` so the icon tracks Fluent's
+/** Inline refresh icon used by the header reconnect button.
+ *  Fluent-ArrowClockwise-style — single 270° arc with an arrowhead.
+ *  Inlined as SVG so we don't pull in @fluentui/react-icons (~10 MB)
+ *  for a single 16×16 glyph. `currentColor` so the icon tracks Fluent's
  *  button foreground tokens (including the disabled state). */
 const ReconnectIcon = () => (
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
         <path
             fill="currentColor"
-            d="M8 2.5a5.5 5.5 0 0 1 4.95 3.094l.66-.66a.5.5 0 1 1 .707.707l-1.5 1.5a.5.5 0 0 1-.707 0l-1.5-1.5a.5.5 0 0 1 .707-.707l.598.598A4.5 4.5 0 0 0 3.5 8a.5.5 0 0 1-1 0A5.5 5.5 0 0 1 8 2.5zm5 5a.5.5 0 0 1 .5.5 5.5 5.5 0 0 1-10.45 2.406l-.66.66a.5.5 0 0 1-.707-.707l1.5-1.5a.5.5 0 0 1 .707 0l1.5 1.5a.5.5 0 0 1-.707.707l-.598-.598A4.5 4.5 0 0 0 12.5 8a.5.5 0 0 1 .5-.5z"
+            d="M8 2.75a5.25 5.25 0 1 0 5.21 5.84.5.5 0 0 1 .99.12A6.25 6.25 0 1 1 8 1.75v-.5a.5.5 0 0 1 .85-.36l1.5 1.5a.5.5 0 0 1 0 .71l-1.5 1.5A.5.5 0 0 1 8 4.25v-1.5z"
         />
     </svg>
 );
