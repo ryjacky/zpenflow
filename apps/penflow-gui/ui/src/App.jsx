@@ -718,14 +718,13 @@ export default function App() {
             statusActionDisabled = true;
             break;
     }
-    // Reconnect icon button next to the status button: enabled whenever
-    // the service is in a stable state where "save + restart" is
-    // meaningful. Transitional/error states block it so we don't pile up
-    // half-completed transitions.
-    const reconnectDisabled =
-        status.state === "preparing"
-        || status.state === "connecting"
-        || status.state === "error";
+    // Reconnect icon button: only surfaces when the status button reads
+    // "Resume" (i.e., state === "stopped"). Everywhere else the action is
+    // either meaningless (transitional/error states) or already covered
+    // by the status button — when connected, the Pause click + auto-save
+    // means any pending changes get flushed on the next Resume, so a
+    // separate Reconnect would just duplicate that path.
+    const reconnectVisible = status.state === "stopped";
     const vddResolution = settings.vdd_resolution ?? DEFAULT_RESOLUTION;
     const selectedResolution = resolutionKey(vddResolution);
     const setVddResolution = (next) => {
@@ -737,20 +736,21 @@ export default function App() {
             <header className={styles.header}>
                 <Title3 className={styles.title}>Penflow</Title3>
                 <span className={styles.statusDetail}>{statusDescription(status)}</span>
-                <Tooltip
-                    content="Reconnect — save settings and restart the session"
-                    relationship="description"
-                    withArrow
-                >
-                    <Button
-                        appearance="subtle"
-                        icon={<ReconnectIcon />}
-                        onClick={onConnect}
-                        disabled={reconnectDisabled}
-                        className={styles.reconnectIconBtn}
-                        aria-label="Reconnect"
-                    />
-                </Tooltip>
+                {reconnectVisible && (
+                    <Tooltip
+                        content="Reconnect — save settings and restart the session"
+                        relationship="description"
+                        withArrow
+                    >
+                        <Button
+                            appearance="subtle"
+                            icon={<ReconnectIcon />}
+                            onClick={onConnect}
+                            className={styles.reconnectIconBtn}
+                            aria-label="Reconnect"
+                        />
+                    </Tooltip>
+                )}
                 <Button
                     appearance="primary"
                     onClick={onToggle}
