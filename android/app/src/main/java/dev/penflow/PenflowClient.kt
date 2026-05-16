@@ -258,7 +258,28 @@ class PenflowClient(
                 //    returns when the session genuinely ends; see the
                 //    reconnect loop in `connect()` which expects exactly
                 //    that semantic).
-                val rJob = scope.launch { readLoop(input, dec) }
+                //
+                //    The try/catch here is load-bearing: the PC can drop
+                //    the socket without a graceful MSG_PC_GOODBYE (e.g.
+                //    when the user clicks Pause, which cancels the Rust
+                //    session future mid-write), and `Protocol.recvMsg`
+                //    then throws IOException("socket closed") / EOFException.
+                //    Without this guard the exception escapes the
+                //    `scope.launch` boundary and crashes the process,
+                //    because the scope's SupervisorJob has no
+                //    CoroutineExceptionHandler installed. Catching here
+                //    lets `rJob.join()` complete, `handshakeAndPump`
+                //    return, and the reconnect loop in `connect()` retry
+                //    — which is the intended Pause/Resume behaviour.
+                val rJob = scope.launch {
+                    try {
+                        readLoop(input, dec)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "readLoop ended: ${t.javaClass.simpleName}: ${t.message}")
+                    }
+                }
                 readerJob = rJob
 
                 // 6. start periodic time-sync ping (1 Hz)
