@@ -211,6 +211,11 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
     // Ctrl-C handler. tokio::signal::ctrl_c is async; race against the
     // session.
     let session = Session::new(cfg);
+    // 3rd arg = graceful-cancel oneshot. The GUI uses it to let Pause
+    // signal Session::run to wrap up cleanly (write MSG_PC_GOODBYE,
+    // close the socket) so Android doesn't end up stuck on a dead
+    // connection. This CLI has no pause concept — Ctrl-C just drops the
+    // whole process — so we pass None.
     let session_run = session.run(transport.clone(), Some(tx), None);
     tokio::select! {
         r = session_run => match r {

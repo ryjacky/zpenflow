@@ -274,16 +274,15 @@ impl Session {
     /// Run one session: open the engine, accept the transport stream, do the
     /// handshake, pump frames + dispatch input until the client disconnects.
     ///
-    /// `events` (optional) receives lifecycle notifications.
+    /// `events` (optional) receives lifecycle notifications. The function
+    /// returns after the connection ends or `stop` flag is set.
     ///
-    /// `cancel` (optional) is a graceful-stop signal. When the receiver
-    /// fires, the read loop is aborted and the function falls through to
-    /// its normal cleanup path — including the [`MSG_PC_GOODBYE`] write —
-    /// instead of being dropped mid-session. Pass `None` for "run until
-    /// the client hangs up." Required by the GUI pause path: dropping
-    /// `Session::run` via `tokio::select!` skips the goodbye write, and
-    /// `adb reverse` doesn't propagate TCP FIN to Android, so the client
-    /// never realises the PC has paused.
+    /// `cancel` (optional) requests graceful shutdown. When the receiver
+    /// fires, the read loop is aborted but cleanup still runs, so
+    /// [`MSG_PC_GOODBYE`] is written before return. Without this the
+    /// Android client blocks on a stale socket — `adb reverse` doesn't
+    /// propagate TCP FIN. Pass `None` to run until the client
+    /// disconnects.
     pub async fn run(
         mut self,
         transport: Arc<dyn Transport>,
@@ -822,9 +821,11 @@ impl Session {
         // read_loop wants an idr sender; with no engine we just drop the rx.
         let (idr_tx, _idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-        // Race the read loop against the graceful-cancel signal so a GUI
-        // Pause still hits the MSG_PC_GOODBYE write below instead of
-        // being dropped mid-await.
+        // `select!` between the read loop and the cancel signal: whichever
+        // completes first wins, the other is dropped. Both paths fall
+        // through to the MSG_PC_GOODBYE write below. Routing cancel through
+        // here (instead of letting the caller drop the whole future on
+        // Pause) is what keeps that write reachable.
         let read_future = read_loop(
             reader,
             writer.clone(),

@@ -220,22 +220,16 @@ impl Service {
             });
 
             eprintln!("[service] running session (waiting for android client)");
-            // Build a per-session cancel pair. We forward the outer
-            // accept-loop cancel into the session so it can do graceful
-            // teardown (MSG_PC_GOODBYE write + transport drop) instead of
-            // being aborted mid-await. Without this, `adb reverse` won't
-            // propagate FIN to Android and the client sits on a stale
-            // socket forever — repro: pause, then reconnect, Android UI
-            // says "connected" but PC stays on Listening.
+            // When the GUI calls stop() it fires `cancel` (the accept-loop
+            // parameter). We forward that into the session via this pair
+            // so it can write MSG_PC_GOODBYE before teardown — `adb
+            // reverse` doesn't propagate FIN, so without this Android
+            // stays stuck on a dead socket.
             let (session_cancel_tx, session_cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            //
-            // The session_run future is scoped so that it is *dropped*
-            // before we call `transport.shutdown()` below. If we paused
-            // pre-handshake, the session is blocked inside
-            // `transport.accept().await` and will never observe its
-            // cancel signal; the bounded `timeout(...)` falls through,
-            // the scope exits, and the drop releases the listener mutex
-            // that `transport.shutdown()` needs.
+            // Scope session_run so it drops before transport.shutdown():
+            // a pre-handshake pause is blocked in accept() and can't
+            // observe its cancel; drop releases the listener mutex
+            // shutdown needs.
             let cancelled = {
                 let session = Session::new(cfg);
                 let session_run = session.run(
@@ -244,7 +238,11 @@ impl Service {
                     Some(session_cancel_rx),
                 );
                 tokio::pin!(session_run);
-                // Phase 1: race session against outer cancel.
+                // Phase 1: either the session ends on its own (Android
+                // disconnects → read loop EOF → cleanup) or the user
+                // clicks Pause (cancel fires). Whichever happens first
+                // wins; on Pause we signal the session to wrap up and
+                // Phase 2 below awaits its goodbye + cleanup.
                 let cancelled = tokio::select! {
                     r = &mut session_run => {
                         match r {
