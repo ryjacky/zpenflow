@@ -23,7 +23,7 @@ Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg
 
 - 通过捆绑的虚拟显示器驱动（VDD）默认做一块 **2880×1800 的 120 Hz 虚拟显示器**，平板上可以看到原生 1:1 像素、不经任何缩放；GUI 里也可以改成更低的自定义 VDD 分辨率，以降低编码负载。Wacom IPD 是 mirror + scale，把源屏拉伸/适配到平板面板，设置里**没有原生分辨率开关**（[Gigazine 2025/12 实测](https://gigazine.net/gsc_news/en/20251206-instant-pen-display-mode/) 提到曲线放大后会变模糊）。整条管线还跑在 120 Hz，是 Wacom 60 Hz 路径的两倍。
 - 同一台机器上实测，笔尖到像素的延迟从 Wacom 的 **~60–70 ms** 降到 **~26 ms**。
-- **Pro Pen 3 的三个侧键**全部可独立绑定（点击 / 按住 / 鼠标键 / 橡皮切换）。Wacom 的 PC 模式根本不会把侧键事件传给 Windows。
+- **Pro Pen 3 的三个侧键**全部可独立绑定（点击 / 按住 / 鼠标键 / 橡皮切换）。Wacom 的 PC 模式根本不会把侧键事件传给 Windows。绑定为右键时提供 Wacom 的两种模式 —— **按住并点击**（按住侧键后落笔）和 **悬空点击**（悬空按下即触发），见[右键模式](#右键模式)。
 - **完全开源**，可定制到协议层。
 
 > **状态**：pre-v1.0，开发中。当前仅支持 Windows 主机；macOS 主机支持在 [路线图](#路线图) 里。
@@ -59,6 +59,19 @@ Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg
 - 🚀 **GPU 直通 HEVC** — DXGI Desktop Duplication 直接把桌面抓到 D3D11 纹理；编码器 MFT 在同一张纹理上跑，全程不过系统内存。
 - 🔌 **纯 USB 路径** — 跑在 `adb reverse` 之上，无需 Wi-Fi 设置、无 NAT、无每个网络重新配置。插上、启动、画。
 - 🖥️ **120 Hz 虚拟扩展屏** — 捆绑的 `MttVDD` 把平板暴露成一块独立的 120 Hz 扩展桌面，而不是 60 Hz 主屏镜像。整条管线（抓屏 → 编码 → 解码 → 渲染）全程 120 Hz 跑，落笔的流畅度是 Wacom 60 Hz 路径的两倍。
+
+### 右键模式
+
+侧键绑定为**右键**时，提供与 Wacom 驱动相同的两种模式。这不只是偏好设置 —— 两者走的输入路径不同，这决定了哪些应用会认它。
+
+| 模式 | 操作 | 投递方式 | Chrome 网页内可用 |
+|---|---|---|---|
+| **按住并点击** | 按住侧键，然后落笔 | 走笔自身的 HID barrel 键。Windows 在笔尖坐标上抬起 `POINTER_FLAG_SECONDBUTTON`，不合成任何鼠标输入。 | ✅ |
+| **悬空点击** | 悬空状态下按下侧键 | 合成的 `SendInput` 鼠标点击 —— Windows 的笔模型里没有"悬空按键"这个状态（[barrel 被定义为笔尖动作的修饰键](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/supporting-usages-in-digitizer-report-descriptors)）。Wacom 驱动也是这么合成的。 | ❌ |
+
+悬空点击在桌面、资源管理器、Clip Studio Paint，以及 Chrome 自己的标签栏和工具栏上都正常 —— 但**在 Chrome 网页内容里无效**。Chromium 会把「距上一条笔 `WM_POINTER` 消息 500 ms 以内、且坐标与当前光标位置相同」的鼠标消息判定为笔合成的重复事件（`EF_FROM_TOUCH`），直接不转发给渲染进程。而我们既持续推送笔数据，又在点击前把光标对齐到笔尖，两个条件同时成立。这一点无法通过改 HID 报文解决，它是注入式鼠标输入的固有属性。要在浏览器里右键，请用按住并点击。
+
+按住并点击仅支持右键：HID 笔协议只有一个 barrel usage，且 Windows [不会把其它笔按键 usage 投递给应用](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/supporting-usages-in-digitizer-report-descriptors)。左键和中键始终是合成的。
 
 ## 为什么选 Penflow？
 

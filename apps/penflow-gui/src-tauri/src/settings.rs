@@ -217,8 +217,15 @@ pub enum Binding {
     KeyHold { key: String },
     /// Send the keys in order with the last held until release.
     KeyChord { keys: Vec<String> },
-    /// Synthesize a mouse button press while pressed.
-    MouseButton { button: MouseButton },
+    /// Press a mouse button while pressed. `mode` picks when the click
+    /// fires; see `penflow_core::inject::binding::ClickMode`.
+    MouseButton {
+        button: MouseButton,
+        /// Absent in settings written before click modes existed. Defaults
+        /// to `HoverClick`, which is what those settings already did.
+        #[serde(default)]
+        mode: ClickMode,
+    },
     /// Toggle the pen's eraser tool flag for the lifetime of the press.
     EraserToggle,
 }
@@ -229,6 +236,22 @@ pub enum MouseButton {
     Left,
     Right,
     Middle,
+}
+
+/// When a `MouseButton` binding fires. Mirrors Wacom's two pen-button modes.
+///
+/// `ClickAndTap` is only honoured for the right button — the HID pen contract
+/// has a single barrel usage. Anything else falls back to `HoverClick` with a
+/// log line (see `service::convert_binding`).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickMode {
+    /// Click on button press while hovering. Synthetic mouse input.
+    #[default]
+    HoverClick,
+    /// Click when the button is held and the tip touches down. Native pen
+    /// barrel; the only mode that survives Chromium's injected-mouse filter.
+    ClickAndTap,
 }
 
 /// Returns the path to `settings.json` under `%APPDATA%/Penflow/`. The
@@ -400,5 +423,34 @@ mod tests {
         .validate()
         .expect_err("odd width should be rejected");
         assert!(err.contains("even"));
+    }
+
+    #[test]
+    fn legacy_mouse_button_binding_defaults_to_hover_click() {
+        // Settings written before click modes existed must keep the exact
+        // behaviour they had, so the absent field means HoverClick.
+        let binding: Binding =
+            serde_json::from_str(r#"{"kind":"mouse_button","button":"right"}"#).unwrap();
+        match binding {
+            Binding::MouseButton { button, mode } => {
+                assert_eq!(button, MouseButton::Right);
+                assert_eq!(mode, ClickMode::HoverClick);
+            }
+            other => panic!("expected MouseButton, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn click_and_tap_round_trips_through_json() {
+        let binding = Binding::MouseButton {
+            button: MouseButton::Right,
+            mode: ClickMode::ClickAndTap,
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(json.contains(r#""mode":"click_and_tap""#), "got {json}");
+        match serde_json::from_str::<Binding>(&json).unwrap() {
+            Binding::MouseButton { mode, .. } => assert_eq!(mode, ClickMode::ClickAndTap),
+            other => panic!("expected MouseButton, got {other:?}"),
+        }
     }
 }

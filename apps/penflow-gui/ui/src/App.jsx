@@ -357,7 +357,13 @@ function joinKeySpec(mods, key) {
 
 /** Convert a Rust `Binding` enum value into editor state. */
 function bindingToState(binding) {
-    const s = { kind: binding.kind, mods: [], key: "", mouse: "left" };
+    const s = {
+        kind: binding.kind,
+        mods: [],
+        key: "",
+        mouse: "left",
+        clickMode: "hover_click",
+    };
     switch (binding.kind) {
         case "key_tap":
         case "key_hold":
@@ -368,6 +374,7 @@ function bindingToState(binding) {
             break;
         case "mouse_button":
             s.mouse = binding.button ?? "left";
+            s.clickMode = binding.mode ?? "hover_click";
             break;
     }
     return s;
@@ -380,7 +387,14 @@ function stateToBinding(s) {
         case "key_tap":      return { kind: "key_tap",  key: joinKeySpec(s.mods, s.key) };
         case "key_hold":     return { kind: "key_hold", key: joinKeySpec(s.mods, s.key) };
         case "key_chord":    return { kind: "key_chord", keys: [...s.mods, s.key].filter(Boolean) };
-        case "mouse_button": return { kind: "mouse_button", button: s.mouse };
+        // Click & tap rides the pen's single barrel usage, which Windows only
+        // exposes as the right button. Persist the honest value so the backend
+        // never has to coerce (and log) a combination we could rule out here.
+        case "mouse_button": return {
+            kind: "mouse_button",
+            button: s.mouse,
+            mode: s.mouse === "right" ? s.clickMode : "hover_click",
+        };
     }
 }
 
@@ -397,6 +411,7 @@ function BindingRow({ label, slot, onChange, styles }) {
     };
     const setKey = (mods, key) => onChange({ ...slot, mods, key });
     const setMouse = (mouse) => onChange({ ...slot, mouse });
+    const setClickMode = (clickMode) => onChange({ ...slot, clickMode });
     const clear = () => onChange({ ...slot, mods: [], key: "" });
 
     const onKeyDown = (e) => {
@@ -432,21 +447,49 @@ function BindingRow({ label, slot, onChange, styles }) {
             );
         }
         if (slot.kind === "mouse_button") {
+            // The click-mode switch is right-button only: it selects between
+            // the pen's native barrel button and a synthetic mouse click, and
+            // the barrel can only ever mean "right".
+            const isRight = slot.mouse === "right";
             return (
-                <div className={styles.bindingDetail}>
-                    <div className={styles.mouseGroup}>
-                        {[["left","Left"],["middle","Middle"],["right","Right"]].map(([v, l]) => (
-                            <button
-                                key={v}
-                                type="button"
-                                className={
-                                    styles.mouseBtn + (slot.mouse === v ? " " + styles.mouseBtnOn : "")
-                                }
-                                onClick={() => setMouse(v)}
-                            >{l}</button>
-                        ))}
+                <>
+                    <div className={styles.bindingDetail}>
+                        <div className={styles.mouseGroup}>
+                            {[["left","Left"],["middle","Middle"],["right","Right"]].map(([v, l]) => (
+                                <button
+                                    key={v}
+                                    type="button"
+                                    className={
+                                        styles.mouseBtn + (slot.mouse === v ? " " + styles.mouseBtnOn : "")
+                                    }
+                                    onClick={() => setMouse(v)}
+                                >{l}</button>
+                            ))}
+                        </div>
+                        {isRight && (
+                            <div className={styles.mouseGroup}>
+                                {[["hover_click","Hover click"],["click_and_tap","Click & tap"]].map(([v, l]) => (
+                                    <button
+                                        key={v}
+                                        type="button"
+                                        className={
+                                            styles.mouseBtn
+                                            + (slot.clickMode === v ? " " + styles.mouseBtnOn : "")
+                                        }
+                                        onClick={() => setClickMode(v)}
+                                    >{l}</button>
+                                ))}
+                            </div>
+                        )}
                     </div>
-                </div>
+                    {isRight && (
+                        <span className={styles.bindingDetailEmpty}>
+                            {slot.clickMode === "click_and_tap"
+                                ? "Hold the button, then touch the pen down. Uses the pen's native barrel button, so it works in Chrome and other apps that filter injected clicks."
+                                : "Clicks as soon as the button is pressed, without touching down. Does not reach Chrome web pages — Chrome drops injected clicks while the pen is in range."}
+                        </span>
+                    )}
+                </>
             );
         }
         // key_tap / key_hold / key_chord

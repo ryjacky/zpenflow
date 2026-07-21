@@ -18,7 +18,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use penflow_core::inject::binding::{Binding as CoreBinding, MouseButtonKind, PenButtonProfile};
+use penflow_core::inject::binding::{
+    Binding as CoreBinding, ClickMode as CoreClickMode, MouseButtonKind, PenButtonProfile,
+};
 use penflow_core::Engine;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
@@ -30,8 +32,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 use crate::settings::{
-    self, write_installed_vdd_settings, MouseButton as SettingsMouseButton, PenBindings,
-    SharedSettings,
+    self, write_installed_vdd_settings, ClickMode as SettingsClickMode,
+    MouseButton as SettingsMouseButton, PenBindings, SharedSettings,
 };
 
 /// Lifecycle events emitted by the running [`Service`]. Forwarded to
@@ -495,11 +497,31 @@ fn convert_binding(b: &settings::Binding) -> CoreBinding {
     match b {
         settings::Binding::None => CoreBinding::None,
         settings::Binding::EraserToggle => CoreBinding::EraserToggle,
-        settings::Binding::MouseButton { button } => CoreBinding::MouseButton(match button {
-            SettingsMouseButton::Left => MouseButtonKind::Left,
-            SettingsMouseButton::Right => MouseButtonKind::Right,
-            SettingsMouseButton::Middle => MouseButtonKind::Middle,
-        }),
+        settings::Binding::MouseButton { button, mode } => {
+            let button = match button {
+                SettingsMouseButton::Left => MouseButtonKind::Left,
+                SettingsMouseButton::Right => MouseButtonKind::Right,
+                SettingsMouseButton::Middle => MouseButtonKind::Middle,
+            };
+            // Click & Tap rides the pen's single HID barrel usage, which
+            // Windows only exposes as the secondary (right) action. Coerce
+            // rather than silently mislead — a hand-edited settings.json can
+            // ask for it on any button.
+            let mode = match (mode, button) {
+                (SettingsClickMode::HoverClick, _) => CoreClickMode::HoverClick,
+                (SettingsClickMode::ClickAndTap, MouseButtonKind::Right) => {
+                    CoreClickMode::ClickAndTap
+                }
+                (SettingsClickMode::ClickAndTap, other) => {
+                    eprintln!(
+                        "[bindings] click_and_tap is only available for the right button \
+                         ({other:?} requested); falling back to hover_click"
+                    );
+                    CoreClickMode::HoverClick
+                }
+            };
+            CoreBinding::MouseButton { button, mode }
+        }
         settings::Binding::KeyTap { key } => match parse_key_combo(key) {
             Some(keys) if keys.len() == 1 => CoreBinding::KeyTap(keys[0]),
             Some(keys) if keys.len() > 1 => CoreBinding::KeyChord(keys),
@@ -715,10 +737,40 @@ mod tests {
     fn convert_mouse_button_passes_kind() {
         let b = settings::Binding::MouseButton {
             button: SettingsMouseButton::Right,
+            mode: SettingsClickMode::HoverClick,
         };
         match convert_binding(&b) {
-            CoreBinding::MouseButton(MouseButtonKind::Right) => {}
+            CoreBinding::MouseButton { button, mode } => {
+                assert_eq!(button, MouseButtonKind::Right);
+                assert_eq!(mode, CoreClickMode::HoverClick);
+            }
             other => panic!("expected MouseButton(Right), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_right_click_and_tap_reaches_the_core_unchanged() {
+        let b = settings::Binding::MouseButton {
+            button: SettingsMouseButton::Right,
+            mode: SettingsClickMode::ClickAndTap,
+        };
+        let converted = convert_binding(&b);
+        assert!(converted.drives_native_barrel(), "got {converted:?}");
+    }
+
+    #[test]
+    fn convert_click_and_tap_on_non_right_falls_back_to_hover() {
+        for button in [SettingsMouseButton::Left, SettingsMouseButton::Middle] {
+            let b = settings::Binding::MouseButton {
+                button,
+                mode: SettingsClickMode::ClickAndTap,
+            };
+            match convert_binding(&b) {
+                CoreBinding::MouseButton { mode, .. } => {
+                    assert_eq!(mode, CoreClickMode::HoverClick, "for {button:?}");
+                }
+                other => panic!("expected MouseButton, got {other:?}"),
+            }
         }
     }
 }

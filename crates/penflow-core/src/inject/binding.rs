@@ -25,6 +25,47 @@ pub enum MouseButtonKind {
     Middle,
 }
 
+/// When a `Binding::MouseButton` fires, mirroring the two pen-button modes
+/// Wacom's driver exposes.
+///
+/// The distinction is not cosmetic — the two modes travel through different
+/// input paths, and only one of them is part of the Windows pen model.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClickMode {
+    /// Fire from the button alone while the pen hovers, without touching the
+    /// surface.
+    ///
+    /// Windows has no native equivalent: MSDN scopes
+    /// `POINTER_FLAG_SECONDBUTTON` to a pen "in contact with the digitizer
+    /// surface with the pen barrel button pressed", and describes the barrel
+    /// as a modifier for the tip's action, not an independent button. So this
+    /// mode is necessarily a synthetic `SendInput` mouse click — the same
+    /// mechanism Wacom's own driver uses for it.
+    ///
+    /// Consequence worth knowing before choosing it: Chromium classifies a
+    /// mouse message that arrives within 500 ms of a pen `WM_POINTER` message
+    /// *at the current cursor position* as a pen-synthesised duplicate, tags
+    /// it `EF_FROM_TOUCH`, and never forwards it to the renderer. Because we
+    /// stream pen samples continuously and warp the cursor to the pen tip
+    /// before the click, both conditions hold, and the click is dropped over
+    /// web content. It still works on browser chrome and in non-Chromium
+    /// apps. `ClickAndTap` has none of these problems.
+    #[default]
+    HoverClick,
+    /// Fire when the button is held **and** the pen tip touches down — the
+    /// Wacom "Click & Tap" convention.
+    ///
+    /// Driven through the VMulti HID barrel bit rather than `SendInput`, so
+    /// Windows produces a genuine pen pointer event at the pen's own
+    /// coordinate and no synthetic mouse message exists to be filtered.
+    ///
+    /// Only expressible for [`MouseButtonKind::Right`]: the HID digitizer
+    /// contract has exactly one pen-button usage (Barrel, 0x44), and Windows
+    /// documents that additional usages are not delivered to applications in
+    /// `WM_POINTER` messages.
+    ClickAndTap,
+}
+
 #[derive(Clone, Debug)]
 pub enum Binding {
     /// No-op. Useful as a "disabled" slot in a profile.
@@ -39,17 +80,43 @@ pub enum Binding {
     KeyHold(Vec<VIRTUAL_KEY>),
     /// Send all keys down, then all up, in order. Useful for `Ctrl+Z` style.
     KeyChord(Vec<VIRTUAL_KEY>),
-    /// Hold a synthetic mouse button while the barrel is pressed: down on
-    /// press, up on release. Used by people who like the Wacom convention
-    /// of mapping a barrel button to right-click for the context menu.
-    /// HANDOFF §2.3 #4 cautions that mouse-button presses get filtered by
-    /// Windows Ink **during ongoing pen contact** — keep this for off-stroke
-    /// hover use; for in-stroke modifiers prefer `KeyHold`.
-    MouseButton(MouseButtonKind),
+    /// Hold a mouse button while the pen button is pressed: down on press,
+    /// up on release. The Wacom convention of mapping a barrel button to
+    /// right-click for the context menu.
+    ///
+    /// `mode` decides *when* the click fires and, as a direct consequence,
+    /// which input path carries it — see [`ClickMode`]. HANDOFF §2.3 #4
+    /// cautions that synthetic mouse-button presses get filtered by Windows
+    /// Ink **during ongoing pen contact**, which is one more reason
+    /// [`ClickMode::ClickAndTap`] routes through the native barrel instead;
+    /// for in-stroke modifiers prefer `KeyHold`.
+    MouseButton {
+        button: MouseButtonKind,
+        mode: ClickMode,
+    },
     /// Flip the `PEN_FLAG_INVERTED` bit on subsequent pen samples until
     /// pressed again. Krita Windows Ink mode reads the bit as "this is the
     /// eraser end of the pen".
     EraserToggle,
+}
+
+impl Binding {
+    /// True when this binding is served by the pen's native HID barrel bit
+    /// rather than by a synthetic `SendInput` click.
+    ///
+    /// The injector uses this for both halves of the same decision: assert
+    /// the barrel bit on the outgoing pen report while the button is held,
+    /// and suppress the `SendInput` click that would otherwise double-fire
+    /// on top of it (the regression fixed in #42, from the other direction).
+    pub fn drives_native_barrel(&self) -> bool {
+        matches!(
+            self,
+            Binding::MouseButton {
+                button: MouseButtonKind::Right,
+                mode: ClickMode::ClickAndTap,
+            }
+        )
+    }
 }
 
 /// Bindings for one pen's three buttons + the contact threshold.
@@ -126,5 +193,42 @@ mod tests {
     fn predecessor_compat_uses_e_tap() {
         let p = PenButtonProfile::predecessor_compat();
         assert!(matches!(p.tertiary, Binding::KeyTap(VK_E)));
+    }
+
+    #[test]
+    fn only_right_click_and_tap_drives_the_native_barrel() {
+        // The HID descriptor has exactly one pen-button usage, so this is
+        // the only combination that can be served without SendInput.
+        assert!(Binding::MouseButton {
+            button: MouseButtonKind::Right,
+            mode: ClickMode::ClickAndTap,
+        }
+        .drives_native_barrel());
+
+        for b in [
+            Binding::MouseButton {
+                button: MouseButtonKind::Right,
+                mode: ClickMode::HoverClick,
+            },
+            Binding::MouseButton {
+                button: MouseButtonKind::Left,
+                mode: ClickMode::ClickAndTap,
+            },
+            Binding::MouseButton {
+                button: MouseButtonKind::Middle,
+                mode: ClickMode::ClickAndTap,
+            },
+            Binding::KeyTap(VK_E),
+            Binding::None,
+        ] {
+            assert!(!b.drives_native_barrel(), "unexpected native: {b:?}");
+        }
+    }
+
+    #[test]
+    fn click_mode_defaults_to_hover_click() {
+        // Settings written before this field existed must keep behaving the
+        // way they did — HoverClick is the pre-existing semantics.
+        assert_eq!(ClickMode::default(), ClickMode::HoverClick);
     }
 }
