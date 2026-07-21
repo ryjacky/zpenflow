@@ -130,9 +130,14 @@ impl Service {
             let _ = c.send(());
         }
         if let Some(t) = inner.task.take() {
-            // Give the loop a moment to finish naturally; abort if it
-            // ignores the cancel signal.
-            let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+            // Give the loop time to finish naturally — `VddController`'s
+            // Drop spawns the helper-shutdown sequence (5 s wait for the
+            // helper to acknowledge stop + actually run devcon disable),
+            // and `transport.shutdown` adds another 2 s. 10 s leaves
+            // some slack so the persistent `devcon disable` writes
+            // before the process exits (issue #22 — short timeout would
+            // race the cleanup and leak VDD enabled).
+            let _ = tokio::time::timeout(Duration::from_secs(10), t).await;
         }
         inner.last_state = ServiceState::Stopped;
         let _ = self.events.send(ServiceState::Stopped);
@@ -230,11 +235,8 @@ impl Service {
             // deadlock waiting for the listener mutex.
             let cancelled = {
                 let session = Session::new(cfg);
-                let session_run = session.run(
-                    Arc::clone(&transport),
-                    Some(tx),
-                    Some(session_finish_rx),
-                );
+                let session_run =
+                    session.run(Arc::clone(&transport), Some(tx), Some(session_finish_rx));
                 tokio::pin!(session_run);
                 // Phase 1: either the session ends on its own (Android
                 // disconnects → read loop EOF → cleanup) or the user
@@ -271,7 +273,9 @@ impl Service {
                     match tokio::time::timeout(Duration::from_secs(3), &mut session_run).await {
                         Ok(_) => eprintln!("[service] session honored finish signal"),
                         Err(_) => {
-                            eprintln!("[service] session finish timed out — proceeding to teardown");
+                            eprintln!(
+                                "[service] session finish timed out — proceeding to teardown"
+                            );
                             log_diagnostic("[service] session finish timed out");
                         }
                     }
@@ -279,11 +283,7 @@ impl Service {
                 cancelled
             };
             if cancelled {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    transport.shutdown(),
-                )
-                .await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), transport.shutdown()).await;
                 event_pump.abort();
                 return;
             }
