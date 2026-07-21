@@ -23,7 +23,7 @@ Penflow is a free, open-source replacement for **[Wacom Instant Pen Display Mode
 
 - Drives a **120 Hz virtual display at the tablet's exact 2880×1800 panel resolution by default** — so what you see on the tablet can be your desktop at 1:1 native pixels with no resampling. The GUI can also publish a lower custom VDD resolution for lighter encode load. Wacom IPD mirrors-and-scales whatever your source monitor is to fit the panel; there is no native-resolution toggle in its settings UI ([Gigazine, Dec 2025](https://gigazine.net/gsc_news/en/20251206-instant-pen-display-mode/) noted curves blurring under upscaling). The pipeline also runs at 120 Hz vs Wacom's 60 Hz, end-to-end.
 - Cuts pen-to-pixel latency from a measured **~60–70 ms** on Wacom's app to **~26 ms** on Penflow on the same rig.
-- Exposes **all three Pro Pen 3 side switches** with fully customizable per-button bindings (Tap key / Hold key / Mouse button / Eraser toggle). Wacom's PC mode doesn't surface the side switches to Windows at all.
+- Exposes **all three Pro Pen 3 side switches** with fully customizable per-button bindings (Tap key / Hold key / Mouse button / Eraser toggle). Wacom's PC mode doesn't surface the side switches to Windows at all. A right-click binding offers Wacom's two modes — **Click & tap** (hold the button, touch down) and **Hover click** (fires on press, in the air); see [Right-click modes](#right-click-modes).
 - Is **open source** and configurable down to the wire format.
 
 > **Status**: pre-v1.0, actively developed. Currently Windows-only; macOS host support is on the [roadmap](#roadmap).
@@ -59,6 +59,19 @@ If you run Penflow on Intel Arc / iGPU or Radeon and it works (or doesn't), plea
 - 🚀 **HEVC over GPU** — DXGI Desktop Duplication captures the desktop directly to a D3D11 texture; the encoder MFT runs on the same texture without a system-RAM round trip.
 - 🔌 **USB-only path** — runs on top of `adb reverse`, so no Wi-Fi setup, no NAT, no per-network config. Plug in, launch, draw.
 - 🖥️ **120 Hz virtual display** — bundled `MttVDD` exposes the tablet as a separate 120 Hz extended desktop, not a 60 Hz mirror of your primary monitor. The whole pipeline (capture → encode → decode → present) runs at 120 Hz; pen strokes feel 2× smoother than Wacom's 60 Hz path.
+
+### Right-click modes
+
+A pen button bound to **right click** offers the same two modes Wacom's driver does. They are not just a preference — they travel through different input paths, and that decides which applications honour them.
+
+| Mode | Gesture | How it is delivered | Works in Chrome web pages |
+|---|---|---|---|
+| **Click & tap** | Hold the button, then touch the pen down | The pen's own barrel button, over HID. Windows raises `POINTER_FLAG_SECONDBUTTON` at the pen's coordinate; no mouse input is synthesised. | ✅ |
+| **Hover click** | Press the button while hovering | A synthetic `SendInput` mouse click, because Windows has no hover-button state for a pen ([barrel is documented as a modifier for the tip's action](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/supporting-usages-in-digitizer-report-descriptors)). Wacom's driver synthesises it the same way. | ❌ |
+
+Hover click reaches the desktop, Explorer, Clip Studio Paint, and Chrome's own tab strip and toolbar — but **not Chrome web content**. Chromium tags a mouse message that arrives within 500 ms of a pen `WM_POINTER` message at the unchanged cursor position as a pen-synthesised duplicate (`EF_FROM_TOUCH`) and never forwards it to the renderer. Because the pen streams continuously and the cursor is warped to the pen tip before the click, both conditions hold. No HID report shape fixes this; it is a property of injected mouse input. Use Click & tap if you right-click in the browser.
+
+Click & tap is right-button only: the HID pen contract has exactly one barrel usage, and Windows [does not deliver additional pen-button usages to applications](https://learn.microsoft.com/en-us/windows-hardware/design/component-guidelines/supporting-usages-in-digitizer-report-descriptors). Left and middle bindings are always synthetic.
 
 ## Why Penflow?
 

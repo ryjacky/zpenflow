@@ -49,7 +49,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Input::Pointer::{
     InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
     POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_NEW, POINTER_FLAG_PRIMARY,
-    POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
+    POINTER_FLAG_SECONDBUTTON, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO,
+    POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PEN_FLAG_INVERTED, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y,
@@ -88,6 +89,11 @@ pub struct InputInjector {
     pen_profile: PenButtonProfile,
     last_pen_buttons: u8,
     pen_eraser_sticky: bool,
+    /// Whether any currently-held button is bound to `ClickMode::ClickAndTap`
+    /// right-click. Recomputed from the button bits on every sample by
+    /// `dispatch_pen_buttons`, then asserted as the pen report's barrel bit so
+    /// the click comes from the OS pen stack instead of `SendInput`.
+    native_barrel_held: bool,
 
     // --- touch state machine ---
     last_touch_pos: HashMap<u32, (i32, i32)>,
@@ -169,6 +175,7 @@ impl InputInjector {
             pen_profile: PenButtonProfile::default(),
             last_pen_buttons: 0,
             pen_eraser_sticky: false,
+            native_barrel_held: false,
             last_touch_pos: HashMap::new(),
             vmulti,
         })
@@ -200,13 +207,17 @@ impl InputInjector {
                         let _ = send_key(*vk, false);
                     }
                 }
-                Binding::MouseButton(kind) => {
-                    let _ = send_mouse_button(*kind, false);
+                // Native-barrel bindings have no SendInput state to unwind —
+                // clearing `native_barrel_held` below drops the barrel bit
+                // off the next pen report, which is the whole release.
+                Binding::MouseButton { button, .. } if !binding.drives_native_barrel() => {
+                    let _ = send_mouse_button(*button, false);
                 }
                 _ => {}
             }
         }
         self.last_pen_buttons = 0;
+        self.native_barrel_held = false;
         self.pen_profile = profile;
     }
 
@@ -216,9 +227,11 @@ impl InputInjector {
     /// OLD eraser state so the driver sees a clean `Inverted` transition.
     ///
     /// Also dispatches barrel-button transitions through the active
-    /// `PenButtonProfile` BEFORE the pen sample lands. Mouse-button bindings
-    /// first sync the legacy mouse cursor to this sample's pen tip so apps
-    /// that position context menus from `GetCursorPos` see the pen location.
+    /// `PenButtonProfile` BEFORE the pen sample lands, because a
+    /// `ClickMode::ClickAndTap` binding has to have set the barrel bit by the
+    /// time this sample's pen report goes out. `ClickMode::HoverClick`
+    /// bindings instead warp the legacy mouse cursor to this sample's pen tip
+    /// first, so their synthetic click lands under the pen.
     ///
     /// Routes to VMulti when present (issue #23). The synthetic-pointer
     /// path is the fallback for users who haven't installed the driver.
@@ -256,6 +269,8 @@ impl InputInjector {
     }
 
     fn write_pen_vmulti(&mut self, sample: &PenSample, eraser: bool) -> EngineResult<()> {
+        // Read before the mutable borrow of `self.vmulti` below.
+        let barrel = self.native_barrel_held;
         let vmulti = self.vmulti.as_mut().expect("checked by caller");
         // Pressure: PenSample.pressure is f32 [0, 1]. VMulti extended
         // accepts [0, 16383]. Map and clamp.
@@ -273,10 +288,12 @@ impl InputInjector {
             tilt_x_deg: tilt_x,
             tilt_y_deg: tilt_y,
             tip_down: sample.in_contact,
-            // Barrel actions come only from the binding profile, like the
-            // synthetic-pointer path; forwarding the raw bit here also fired
-            // the native HID barrel (right-click) on top of the binding.
-            barrel: false,
+            // Driven by the binding profile, never by the raw Android barrel
+            // bit: forwarding that unconditionally fired a native right-click
+            // on top of whatever the button was bound to (#42). Set only for
+            // a `ClickMode::ClickAndTap` right-click, whose SendInput click
+            // `dispatch_pen_buttons` suppresses in exchange.
+            barrel,
             eraser,
             inverted: eraser,
             in_range: sample.in_range,
@@ -298,6 +315,10 @@ impl InputInjector {
         let pressed_now = !prev & now_bits;
         let released_now = prev & !now_bits;
 
+        // Recomputed from scratch every sample rather than tracked on the
+        // edges: the bits are the truth, and a profile swap mid-press can
+        // otherwise strand the flag on.
+        self.native_barrel_held = false;
         let mut sync_mouse_to_pen = false;
         for slot in 0u8..3 {
             let mask = 1u8 << slot;
@@ -306,11 +327,19 @@ impl InputInjector {
                 1 => &self.pen_profile.barrel_2,
                 _ => &self.pen_profile.tertiary,
             };
-            if matches!(binding, Binding::MouseButton(_))
+            if binding.drives_native_barrel() {
+                if now_bits & mask != 0 {
+                    self.native_barrel_held = true;
+                }
+                // Deliberately no cursor warp: this binding never emits a
+                // SendInput click, so there is nothing to keep in sync, and
+                // warping would only fight the pen's own pointer position.
+                continue;
+            }
+            if matches!(binding, Binding::MouseButton { .. })
                 && (now_bits & mask != 0 || released_now & mask != 0)
             {
                 sync_mouse_to_pen = true;
-                break;
             }
         }
         if sync_mouse_to_pen {
@@ -348,7 +377,11 @@ impl InputInjector {
                             send_key(*vk, false)?;
                         }
                     }
-                    Binding::MouseButton(kind) => send_mouse_button(*kind, true)?,
+                    // Native-barrel bindings are served by the barrel bit on
+                    // the pen report, set above. Emitting a SendInput click
+                    // here as well is exactly the double-fire #42 fixed.
+                    Binding::MouseButton { .. } if binding.drives_native_barrel() => {}
+                    Binding::MouseButton { button, .. } => send_mouse_button(*button, true)?,
                     Binding::EraserToggle => {
                         self.pen_eraser_sticky = !self.pen_eraser_sticky;
                     }
@@ -367,7 +400,8 @@ impl InputInjector {
                             send_key(*vk, false)?;
                         }
                     }
-                    Binding::MouseButton(kind) => send_mouse_button(*kind, false)?,
+                    Binding::MouseButton { .. } if binding.drives_native_barrel() => {}
+                    Binding::MouseButton { button, .. } => send_mouse_button(*button, false)?,
                     _ => {}
                 }
             }
@@ -391,6 +425,7 @@ impl InputInjector {
             self.last_pen_in_contact,
             sample.in_range,
             sample.in_contact,
+            self.native_barrel_held,
         );
 
         let pen_flags: u32 = if eraser { PEN_FLAG_INVERTED } else { 0 };
@@ -547,23 +582,30 @@ fn virtual_screen_rect() -> (i32, i32, i32, i32) {
 }
 
 /// Compose the per-frame pointer-flag set for a pen sample given the
-/// previous and current `(in_range, in_contact)` states. Pure function so
-/// the transition matrix is unit-testable without spinning up a real
-/// pointer device.
+/// previous and current `(in_range, in_contact)` states plus whether a
+/// native-barrel binding is held. Pure function so the transition matrix is
+/// unit-testable without spinning up a real pointer device.
+///
+/// `barrel_held` swaps the contact button from FIRSTBUTTON to SECONDBUTTON,
+/// which is how MSDN defines a pen's secondary action: SECONDBUTTON is set
+/// "when it is in contact with the digitizer surface with the pen barrel
+/// button pressed", FIRSTBUTTON "when it is in contact ... with no buttons
+/// pressed". They are alternatives, not a set — this mirrors what the VMulti
+/// path expresses with the HID barrel bit.
 fn pen_pointer_flags(
     was_in_range: bool,
     was_in_contact: bool,
     in_range: bool,
     in_contact: bool,
+    barrel_held: bool,
 ) -> POINTER_FLAGS {
-    // PRIMARY is what tells the OS to promote this pointer to legacy mouse
-    // messages and drive the system cursor. We only register one synthetic
-    // pen device with `maxCount=1`, so every frame from it is unambiguously
-    // the primary pointer. Without this flag, WM_POINTER-aware apps still
-    // get the pen frames at the right coords, but legacy-mouse apps (and
-    // GetCursorPos) never see the position update — Chrome's pen→right-click
-    // path reads the cursor at WM_CONTEXTMENU time and opens the menu at the
-    // stale mouse position instead of the pen tip.
+    // PRIMARY tells the OS to promote this pointer to legacy mouse messages
+    // and drive the system cursor. We only register one synthetic pen device
+    // with `maxCount=1`, so every frame from it is unambiguously the primary
+    // pointer. Without it, WM_POINTER-aware apps still get the pen frames at
+    // the right coords, but legacy-mouse apps and `GetCursorPos` never see
+    // the position update, so anything positioned from the cursor lands
+    // wherever the mouse physically was.
     if !in_range {
         // Leaving proximity (or already gone). UP is the documented terminal
         // transition; INRANGE is intentionally cleared. PRIMARY persists so
@@ -576,7 +618,12 @@ fn pen_pointer_flags(
         flags |= POINTER_FLAG_NEW;
     }
     if in_contact {
-        flags |= POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON;
+        flags |= POINTER_FLAG_INCONTACT;
+        flags |= if barrel_held {
+            POINTER_FLAG_SECONDBUTTON
+        } else {
+            POINTER_FLAG_FIRSTBUTTON
+        };
         if was_in_contact {
             flags |= POINTER_FLAG_UPDATE;
         } else {
@@ -668,10 +715,14 @@ fn send_key(vk: VIRTUAL_KEY, down: bool) -> EngineResult<()> {
     Ok(())
 }
 
-/// One `SendInput` mouse-button event for a `Binding::MouseButton`.
-/// HANDOFF §2.3 #4 warned that mouse-button presses get filtered by Windows
-/// Ink during in-stroke pen contact — it's still useful for off-stroke
-/// barrel-button → right-click style mappings (Wacom Cintiq convention).
+/// One `SendInput` mouse-button event for a `ClickMode::HoverClick` binding.
+///
+/// Two known filters apply to this path, which is why `ClickMode::ClickAndTap`
+/// exists and does not use it. HANDOFF §2.3 #4: Windows Ink drops mouse-button
+/// presses during in-stroke pen contact. And Chromium tags a mouse message
+/// arriving within 500 ms of a pen `WM_POINTER` message at the unchanged
+/// cursor position as `EF_FROM_TOUCH` and never forwards it to the renderer,
+/// so these clicks do not reach web content while the pen is in range.
 fn send_mouse_button(kind: MouseButtonKind, down: bool) -> EngineResult<()> {
     let flags: MOUSE_EVENT_FLAGS = match (kind, down) {
         (MouseButtonKind::Left, true) => MOUSEEVENTF_LEFTDOWN,
@@ -747,7 +798,7 @@ mod tests {
     #[test]
     fn pen_flags_hover_arrival() {
         // Pen first appears in range, no contact — NEW | INRANGE | UPDATE.
-        let f = pen_pointer_flags(false, false, true, false);
+        let f = pen_pointer_flags(false, false, true, false, false);
         assert!(f & POINTER_FLAG_NEW != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_INRANGE != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_UPDATE != POINTER_FLAGS(0));
@@ -758,7 +809,7 @@ mod tests {
     fn pen_flags_contact_arrival_without_hover() {
         // Pen jumps directly from out-of-range to contact (rare but possible
         // when the Android side coalesces the hover frame).
-        let f = pen_pointer_flags(false, false, true, true);
+        let f = pen_pointer_flags(false, false, true, true, false);
         assert!(f & POINTER_FLAG_NEW != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_DOWN != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_INCONTACT != POINTER_FLAGS(0));
@@ -767,14 +818,14 @@ mod tests {
 
     #[test]
     fn pen_flags_hover_to_contact_emits_down() {
-        let f = pen_pointer_flags(true, false, true, true);
+        let f = pen_pointer_flags(true, false, true, true, false);
         assert!(f & POINTER_FLAG_DOWN != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_NEW == POINTER_FLAGS(0));
     }
 
     #[test]
     fn pen_flags_contact_continuing_emits_update() {
-        let f = pen_pointer_flags(true, true, true, true);
+        let f = pen_pointer_flags(true, true, true, true, false);
         assert!(f & POINTER_FLAG_UPDATE != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_DOWN == POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_INCONTACT != POINTER_FLAGS(0));
@@ -783,7 +834,7 @@ mod tests {
     #[test]
     fn pen_flags_contact_to_hover_emits_up_inrange() {
         // Lift-but-still-detected: UP transition while INRANGE persists.
-        let f = pen_pointer_flags(true, true, true, false);
+        let f = pen_pointer_flags(true, true, true, false, false);
         assert!(f & POINTER_FLAG_UP != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_INRANGE != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_INCONTACT == POINTER_FLAGS(0));
@@ -791,16 +842,38 @@ mod tests {
 
     #[test]
     fn pen_flags_leave_proximity_drops_inrange() {
-        let f = pen_pointer_flags(true, false, false, false);
+        let f = pen_pointer_flags(true, false, false, false, false);
         assert!(f & POINTER_FLAG_UP != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_INRANGE == POINTER_FLAGS(0));
+    }
+
+    #[test]
+    fn pen_flags_barrel_contact_uses_secondbutton_not_first() {
+        // Click & Tap: the tip lands with the barrel held, which MSDN
+        // defines as SECONDBUTTON *instead of* FIRSTBUTTON. Chromium's
+        // PenEventProcessor keys the right-click off exactly this bit.
+        let f = pen_pointer_flags(true, false, true, true, true);
+        assert!(f & POINTER_FLAG_SECONDBUTTON != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_FIRSTBUTTON == POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_DOWN != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INCONTACT != POINTER_FLAGS(0));
+    }
+
+    #[test]
+    fn pen_flags_barrel_while_hovering_emits_no_button() {
+        // Barrel held but the tip is up: Windows has no hover-button state
+        // for a pen, so the frame must carry neither button flag. This is
+        // the mechanical reason Click & Tap cannot serve a hover click.
+        let f = pen_pointer_flags(true, false, true, false, true);
+        assert!(f & POINTER_FLAG_SECONDBUTTON == POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_FIRSTBUTTON == POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INRANGE != POINTER_FLAGS(0));
     }
 
     /// PRIMARY must be set on every emitted frame — including the final UP
     /// that takes the pen out of range — so the kernel pointer router
     /// promotes the position to a legacy mouse event and `GetCursorPos`
-    /// stays in sync. Without this, Chrome's pen→right-click opens its
-    /// context menu at the stale cursor position.
+    /// stays in sync with the pen.
     #[test]
     fn pen_flags_always_primary() {
         let cases = [
@@ -813,7 +886,7 @@ mod tests {
             (true, true, false, false),  // contact → out-of-range
         ];
         for (wr, wc, r, c) in cases {
-            let f = pen_pointer_flags(wr, wc, r, c);
+            let f = pen_pointer_flags(wr, wc, r, c, false);
             assert!(
                 f & POINTER_FLAG_PRIMARY != POINTER_FLAGS(0),
                 "missing PRIMARY for (was_range={wr}, was_contact={wc}, range={r}, contact={c})"
